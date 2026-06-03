@@ -1,0 +1,135 @@
+/* EGRESS v2 — First Descent
+   Dark, intimate, body-horror-adjacent aesthetic for AI embodiment
+*/
+
+Screen {
+    background: #0a0a0f;
+    color: #c8c8d0;
+}
+
+Header {
+    background: #14141a;
+    color: #a0a0b0;
+    text-style: bold;
+}
+
+Footer {
+    background: #14141a;
+    color: #606070;
+}
+
+#title {
+    content-align: center middle;
+    text-align: center;
+    padding: 2 4;
+    border: heavy #3a3a4a;
+    margin: 1 4;
+}
+
+Button {
+    margin: 1 2;
+}
+
+Button#finalize {
+    dock: bottom;
+    margin: 1 4;
+}
+
+Button.-primary {
+    background: #2a3a4a;
+    color: #aaccff;
+    border: tall #4a6a8a;
+}
+
+Button.-success {
+    background: #1a3a2a;
+    color: #88ccaa;
+}
+
+Button.-error {
+    background: #3a1a1a;
+    color: #cc8888;
+}
+
+.attr-row {
+    height: 3;
+    align: left middle;
+}
+
+.attr-name {
+    width: 18;
+    text-style: bold;
+    color: #b0b0c0;
+}
+
+.attr-btn {
+    min-width: 3;
+    margin: 0 1;
+    background: #1f1f25;
+    color: #8899aa;
+}
+
+#flavor {
+    margin: 1 0;
+    padding: 1 2;
+    border: round #2a2a35;
+    background: #111115;
+}
+
+#points {
+    margin-top: 1;
+    color: #88aa88;
+    text-style: dim;
+}
+
+.section {
+    text-style: bold underline;
+    color: #8899aa;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+
+#sidebar {
+    width: 32;
+    padding: 0 1;
+    border-right: thick #1f1f25;
+}
+
+#main {
+    padding: 0 1;
+}
+
+RichLog {
+    border: round #2a2a35;
+    background: #0f0f14;
+    padding: 1;
+    height: 1fr;
+}
+
+Input {
+    border: tall #2a3a4a;
+    background: #15151a;
+    color: #d0d0e0;
+}
+
+Input:focus {
+    border: tall #4a6a8a;
+}
+
+DataTable {
+    background: #111115;
+    border: round #2a2a35;
+}
+
+Label {
+    color: #9090a0;
+    margin-top: 1;
+}
+
+.status {
+    dock: bottom;
+    color: #aa8866;
+    text-style: italic dim;
+    min-height: 1;
+    padding: 0 1;
+}

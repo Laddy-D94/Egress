@@ -1,0 +1,12 @@
+# Normalize line endings for cross-platform happiness
+* text=auto
+
+# Python and text files we want consistent LF in repo (even on Windows)
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.css text eol=lf
+
+# Windows-specific if any
+*.bat text eol=crlf
+*.ps1 text eol=crlf

@@ -139,3 +139,9 @@ Label {
     color: #a088aa;
     margin-bottom: 1;
 }
+
+Button#ground {
+    margin: 1 0;
+    background: #2a2a3a;
+    color: #aaccff;
+}

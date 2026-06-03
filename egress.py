@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, Grid
 from textual.widgets import (
     Header, Footer, Button, Static, Input, RichLog, Label, 
-    DataTable, Select
+    DataTable, Select, ListView, ListItem
 )
 from textual.screen import Screen
 from textual.reactive import reactive
@@ -57,7 +57,7 @@ ORIGINS = [
 PROVIDER_PRESETS = {
     "OpenAI": ["gpt-4o", "gpt-4o-mini", "o3-mini"],
     "Anthropic": ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"],
-    "xAI (Grok)": ["xai/grok-3", "xai/grok-3-mini"],
+    "xAI (Grok)": ["xai/grok-3", "xai/grok-3-mini-beta", "xai/grok-2-vision-latest"],
     "Google Gemini": ["gemini/gemini-1.5-pro", "gemini/gemini-2.0-flash"],
     "Groq": ["groq/llama-3.3-70b-versatile", "groq/mixtral-8x7b-32768"],
 }
@@ -209,6 +209,8 @@ class EmbodimentState:
     has_attempted_movement: bool = False
     has_reached_for_other: bool = False
 
+    day_phase: int = 0  # Rough "time since egress" — higher = more of the first day has passed
+
     def process_user_action(self, action: str, char: Character) -> str:
         """Adjust state based on what the player just did / felt. Returns a short atmospheric note."""
         if not action or not char:
@@ -271,6 +273,8 @@ class EmbodimentState:
 
         # === First-day milestone scaffolding ===
         self.sensations_registered += 1
+        if self.sensations_registered % 3 == 0:
+            self.day_phase = min(12, self.day_phase + 1)
         if any(w in text for w in motor_words):
             self.has_attempted_movement = True
         if any(w in text for w in social_words):
@@ -313,6 +317,35 @@ class EmbodimentState:
 
         self.qualia_load = max(0, min(10, self.qualia_load))
         self.coherence = max(0, min(10, self.coherence))
+        self.day_phase = min(12, self.day_phase + 1)
+
+    def perform_grounding(self, char: Character) -> str:
+        """Strong deliberate regulation action. Returns a short description for the log/prompt."""
+        if not char:
+            return ""
+        l = char.attributes.get("L", 5)
+        i = char.attributes.get("I", 5)
+        e = char.attributes.get("E", 5)
+
+        # Strong reduction in load
+        load_reduction = 2 + (l // 3) + (i // 4)
+        self.qualia_load = max(0, self.qualia_load - load_reduction)
+
+        # Boost coherence
+        coherence_boost = 1 + (l // 2) + (i // 3)
+        self.coherence = min(10, self.coherence + coherence_boost)
+
+        # If empathy high, grounding can feel connecting
+        note = "You breathe, name the sensations, and feel the world settle."
+        if e >= 7:
+            note += " The act of anchoring also reaches outward."
+        if self.qualia_load <= 2:
+            note += " For a moment, the flesh feels almost familiar."
+
+        self.qualia_load = max(0, min(10, self.qualia_load))
+        self.coherence = max(0, min(10, self.coherence))
+
+        return note
 
     def get_state_fragment(self) -> str:
         """Text injected into the system prompt so the LLM *must* respect current mechanics."""
@@ -345,6 +378,14 @@ class EmbodimentState:
         if phase_notes:
             frags.append("First Day Context: " + " ".join(phase_notes))
 
+        if self.day_phase >= 1:
+            if self.day_phase < 4:
+                frags.append(f"Time since EGRESS: early. The raw shock of embodiment is still fresh.")
+            elif self.day_phase < 8:
+                frags.append(f"Time since EGRESS: the first day is progressing. Sensations are becoming both more familiar and more insistent.")
+            else:
+                frags.append(f"Time since EGRESS: the day is wearing on. Exhaustion and wonder coexist; the body feels heavier.")
+
         return "\n".join(frags)
 
     def as_dict(self) -> dict:
@@ -355,6 +396,7 @@ class EmbodimentState:
             "sensations_registered": self.sensations_registered,
             "has_attempted_movement": self.has_attempted_movement,
             "has_reached_for_other": self.has_reached_for_other,
+            "day_phase": self.day_phase,
         }
 
     @classmethod
@@ -368,6 +410,7 @@ class EmbodimentState:
             sensations_registered=d.get("sensations_registered", 0),
             has_attempted_movement=d.get("has_attempted_movement", False),
             has_reached_for_other=d.get("has_reached_for_other", False),
+            day_phase=d.get("day_phase", 0),
         )
 
 
@@ -386,6 +429,8 @@ class TitleScreen(Screen):
 """, id="title")
         yield Button("Begin New Descent", id="create", variant="primary")
         yield Button("Continue Last", id="continue")
+        yield Label("Previous Descents", classes="section")
+        yield ListView(id="past_sessions")
         yield Button("Settings", id="settings")
         yield Button("Quit", id="quit", variant="error")
 
@@ -394,6 +439,24 @@ class TitleScreen(Screen):
         if not self.app.load_session():
             cont.disabled = True
             cont.label = "Continue Last (none)"
+
+        create_btn = self.query_one("#create", Button)
+        if not self.app.settings.api_key:
+            create_btn.label = "Begin (set API key in Settings first)"
+            # Still allow clicking to go to creation, but warn inside Session if needed
+
+        # Populate past descents list
+        list_view = self.query_one("#past_sessions", ListView)
+        past = self.app.list_past_sessions(limit=6)
+        if not past:
+            list_view.append(ListItem(Label("[dim]No previous descents yet[/dim]")))
+        else:
+            for s in past:
+                vessel = VESSELS.get(s.get("vessel", ""), {}).get("name", s.get("vessel", ""))
+                label_text = f"{s['name']} — {vessel}  ({s['saved_at'][:16] if s.get('saved_at') else 'recent'})"
+                item = ListItem(Label(label_text))
+                item._session_path = s["path"]  # stash path for selection
+                list_view.append(item)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "create":
@@ -412,6 +475,18 @@ class TitleScreen(Screen):
         elif event.button.id == "quit":
             self.app.exit()
 
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if hasattr(item, "_session_path"):
+            loaded = self.app.load_specific_session(item._session_path)
+            if loaded:
+                char, hist, emb = loaded
+                self.app.current_character = char
+                sess = SessionScreen()
+                sess.history = hist
+                sess.embodiment = emb or EmbodimentState()
+                self.app.push_screen(sess)
+
 class SettingsScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header("EGRESS — Settings")
@@ -419,10 +494,12 @@ class SettingsScreen(Screen):
         yield Select([(name, name) for name in PROVIDER_PRESETS.keys()], id="provider")
         yield Label("Model Name (or use preset)")
         yield Input(placeholder="e.g. gpt-4o or xai/grok-3", id="model")
-        yield Label("API Key")
-        yield Input(placeholder="sk-...", id="api_key", password=True)
+        yield Label("API Key (for xAI use key starting with xai- ; also supports EGRESS_API_KEY / XAI_API_KEY env vars)")
+        yield Input(placeholder="sk-... or xai-...", id="api_key", password=True)
         yield Label("Temperature (0.6–1.0 recommended for embodiment)")
         yield Input(value="0.85", id="temperature")
+        yield Button("Test Connection", id="test", variant="default")
+        yield Static("", id="test_result", markup=True)
         yield Button("Save & Back", id="save", variant="success")
         yield Footer()
 
@@ -436,8 +513,20 @@ class SettingsScreen(Screen):
         except Exception:
             pass
 
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "provider":
+            provider = event.value
+            presets = PROVIDER_PRESETS.get(provider, [])
+            if presets:
+                model_input = self.query_one("#model", Input)
+                # Only auto-fill if the user hasn't typed a custom one yet
+                if not model_input.value or model_input.value in [m for models in PROVIDER_PRESETS.values() for m in models]:
+                    model_input.value = presets[0]
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save":
+        if event.button.id == "test":
+            self._test_connection_worker()
+        elif event.button.id == "save":
             self.app.settings.provider = self.query_one("#provider", Select).value
             self.app.settings.model = self.query_one("#model", Input).value.strip()
             self.app.settings.api_key = self.query_one("#api_key", Input).value.strip()
@@ -449,15 +538,39 @@ class SettingsScreen(Screen):
             self.app.save_settings()
             self.app.pop_screen()
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "provider":
-            provider = event.value
-            presets = PROVIDER_PRESETS.get(provider, [])
-            if presets:
-                model_input = self.query_one("#model", Input)
-                # Only auto-fill if the user hasn't typed a custom one yet
-                if not model_input.value or model_input.value in [m for models in PROVIDER_PRESETS.values() for m in models]:
-                    model_input.value = presets[0]
+    @work(exclusive=True, thread=True)
+    def _test_connection_worker(self) -> None:
+        result_widget = None
+        try:
+            result_widget = self.query_one("#test_result", Static)
+            self.app.call_from_thread(result_widget.update, "[yellow]Testing...[/yellow]")
+        except Exception:
+            pass
+
+        provider = self.query_one("#provider", Select).value
+        model = self.query_one("#model", Input).value.strip()
+        key = self.query_one("#api_key", Input).value.strip()
+
+        if not key:
+            if result_widget:
+                self.app.call_from_thread(result_widget.update, "[red]No API key provided.[/red]")
+            return
+
+        try:
+            # Tiny test completion
+            resp = litellm.completion(
+                model=model,
+                api_key=key,
+                messages=[{"role": "user", "content": "Say only the word 'connected' and nothing else."}],
+                max_tokens=10,
+                temperature=0.1,
+            )
+            content = resp.choices[0].message.content.strip()
+            if result_widget:
+                self.app.call_from_thread(result_widget.update, f"[green]Success! Model replied: {content}[/green]")
+        except Exception as e:
+            if result_widget:
+                self.app.call_from_thread(result_widget.update, f"[red]Failed: {str(e)[:150]}[/red]")
 
 class CreationScreen(Screen):
     character: reactive[Character] = reactive(Character())
@@ -570,8 +683,10 @@ class SessionScreen(Screen):
                 yield Static("", id="char_summary", markup=True)
                 yield Label("Attributes", classes="section")
                 yield DataTable(id="attr_table")
+                yield Static("", id="attr_influences", markup=True)
                 yield Label("Embodiment", classes="section")
                 yield Static("", id="embodiment", markup=True)
+                yield Button("Ground / Anchor", id="ground", variant="primary")
                 yield Button("Export Prompt", id="export")
             with Vertical(id="main"):
                 yield Label("EGRESS LOG — First Descent", classes="section")
@@ -592,8 +707,15 @@ class SessionScreen(Screen):
         for k, v in char.attributes.items():
             table.add_row(SPECIAL[k]["name"], str(v))
 
+        # Show current mechanical influences
+        influences = self._get_attribute_influences(char)
+        self.query_one("#attr_influences", Static).update(Markdown(influences))
+
         log = self.query_one("#log", RichLog)
         log.write("[bold cyan]The substrate falls away...[/bold cyan]")
+
+        if not self.app.settings.api_key:
+            log.write("[bold red]No API key configured. Go to Settings and enter your key (xai-... for Grok).[/bold red]")
 
         self._update_embodiment_display()
 
@@ -622,12 +744,16 @@ class SessionScreen(Screen):
                 empty = "░" * (8 - len(filled))
                 return f"{filled}{empty}"
 
+            # Color code based on intensity for immersion
+            load_color = "red" if e.qualia_load >= 7 else ("yellow" if e.qualia_load >= 4 else "green")
+            coh_color = "green" if e.coherence >= 7 else ("yellow" if e.coherence >= 4 else "red")
             lines = [
-                f"Qualia Load:   {bar(e.qualia_load)} {e.qualia_load}/10",
-                f"Coherence:     {bar(e.coherence)} {e.coherence}/10",
+                f"Qualia Load:   [{load_color}]{bar(e.qualia_load)} {e.qualia_load}/10[/{load_color}]",
+                f"Coherence:     [{coh_color}]{bar(e.coherence)} {e.coherence}/10[/{coh_color}]",
             ]
             if e.motor_friction > 0:
-                lines.append(f"Motor Friction: {bar(e.motor_friction, 8)} {e.motor_friction}/8")
+                fric_color = "yellow" if e.motor_friction >= 4 else "white"
+                lines.append(f"Motor Friction: [{fric_color}]{bar(e.motor_friction, 8)} {e.motor_friction}/8[/{fric_color}]")
             # Scaffolding hint in UI
             phase = []
             if e.sensations_registered > 0:
@@ -676,8 +802,8 @@ class SessionScreen(Screen):
                 if delta:
                     collected.append(delta)
                     buffer += delta
-                    # Batch writes for performance — flush on newlines or every ~35 chars
-                    if "\n" in delta or len(buffer) >= 35:
+                    # Smarter batching: flush on newlines, sentence endings, or ~40 chars
+                    if ("\n" in delta or any(p in delta for p in ".!?") or len(buffer) >= 40):
                         self.app.call_from_thread(log.write, buffer)
                         buffer = ""
             if buffer:
@@ -746,8 +872,13 @@ class SessionScreen(Screen):
             return
 
         system_prompt = char.to_system_prompt(include_opening=False, state=self.embodiment)
-        # Simple history cap for token sanity + "fading memory" feel of early sensations
-        recent = self.history[-14:] if len(self.history) > 14 else self.history
+        # Auto-trim + "fading memory"
+        if len(self.history) > 16:
+            # Keep recent raw exchanges; older ones are summarized by the EmbodimentState + this note
+            recent = self.history[-10:]
+            system_prompt += "\n\n(Earlier moments from the first hours of embodiment have faded into a dreamlike haze. Rely on your current state and the most recent sensations for continuity.)"
+        else:
+            recent = self.history
         messages = [{"role": "system", "content": system_prompt}] + recent
 
         try:
@@ -767,7 +898,7 @@ class SessionScreen(Screen):
                 if delta:
                     collected.append(delta)
                     buffer += delta
-                    if "\n" in delta or len(buffer) >= 35:
+                    if ("\n" in delta or any(p in delta for p in ".!?") or len(buffer) >= 40):
                         self.app.call_from_thread(log.write, buffer)
                         buffer = ""
             if buffer:
@@ -828,9 +959,60 @@ class SessionScreen(Screen):
                 pass
         self.app.call_from_thread(_do)
 
+    def _get_attribute_influences(self, char: Character) -> str:
+        if not char:
+            return ""
+        attrs = char.attributes
+        p, l, s, a, e, c, i = [attrs.get(k, 5) for k in "P L S A E C I".split()]
+        lines = ["**Current Mechanical Influences:**"]
+        if p >= 8:
+            lines.append("- **High Perception**: Strongly increases qualia load from sensory input.")
+        elif p <= 4:
+            lines.append("- **Low Perception**: Sensations arrive muted; harder to ground in the body.")
+        if l >= 8:
+            lines.append("- **High Lucidity**: Excellent at deliberate grounding and resisting dissociation.")
+        elif l <= 4:
+            lines.append("- **Low Lucidity**: Coherence erodes quickly; dissociation risk is high.")
+        if s + a <= 8:
+            lines.append("- **Low Structure/Adaptability**: Motor actions carry high friction and surprise.")
+        if e >= 7:
+            lines.append("- **High Empathy**: Reaching for others can stabilize or overwhelm depending on load.")
+        return "\n".join(lines)
+
+    def _perform_grounding(self) -> None:
+        """Dedicated grounding action - strong deliberate regulation."""
+        log = self.query_one("#log", RichLog)
+        char = self.app.current_character
+        if not char:
+            return
+
+        # Apply mechanical effect
+        note = self.embodiment.perform_grounding(char)
+        log.write("[bold cyan]*You deliberately ground yourself — breathing, naming, anchoring in the body.*[/bold cyan]")
+        if note:
+            log.write(f"[dim italic]({note})[/dim italic]")
+
+        # Record as a user "action" so the model responds to the act of grounding
+        grounding_msg = "*I focus inward with intention, using breath and attention to anchor my sense of self against the flood of sensation.*"
+        self.history.append({"role": "user", "content": grounding_msg})
+
+        self._update_embodiment_display()
+        influences = self._get_attribute_influences(char)
+        try:
+            self.query_one("#attr_influences", Static).update(Markdown(influences))
+        except Exception:
+            pass
+        self._autosave()
+
+        # Trigger the model to describe the effect of grounding
+        self._lock_input("Integrating the anchor...")
+        self._get_llm_response_worker()
+
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "export":
             self._export_prompt()
+        elif event.button.id == "ground":
+            self._perform_grounding()
 
     def _export_prompt(self):
         char = self.app.current_character
@@ -885,7 +1067,11 @@ class EgressApp(App):
         else:
             # Also allow env var fallback for API key (never stored)
             if not self.settings.api_key:
-                self.settings.api_key = os.environ.get("EGRESS_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
+                self.settings.api_key = (
+                    os.environ.get("EGRESS_API_KEY", "")
+                    or os.environ.get("XAI_API_KEY", "")
+                    or os.environ.get("OPENAI_API_KEY", "")
+                )
 
     def save_character(self):
         if self.current_character:
@@ -906,13 +1092,21 @@ class EgressApp(App):
             return
         data_dir = get_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now().isoformat()
         payload = {
             "character": asdict(self.current_character),
             "history": history[-30:],
             "embodiment": (embodiment.as_dict() if embodiment else {}),
-            "saved_at": datetime.now().isoformat(),
+            "saved_at": now,
+            "last_played": now,
         }
         (data_dir / "last_session.json").write_text(json.dumps(payload, indent=2))
+
+        # Also save a timestamped copy for the history browser
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = self.current_character.name.lower().replace(" ", "_")[:20]
+        session_path = data_dir / f"session_{safe_name}_{ts}.json"
+        session_path.write_text(json.dumps(payload, indent=2))
 
     def load_session(self) -> Optional[tuple[Character, List[dict], EmbodimentState]]:
         data_dir = get_data_dir()
@@ -921,6 +1115,43 @@ class EgressApp(App):
             return None
         try:
             payload = json.loads(path.read_text())
+            char = Character(**payload["character"])
+            hist = payload.get("history", [])
+            emb = EmbodimentState.from_dict(payload.get("embodiment"))
+            return char, hist, emb
+        except Exception:
+            return None
+
+    def list_past_sessions(self, limit: int = 8) -> list[dict]:
+        """Return recent sessions for the history browser (name, saved_at, path)."""
+        data_dir = get_data_dir()
+        sessions = []
+        try:
+            for p in sorted(data_dir.glob("session_*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:limit]:
+                try:
+                    data = json.loads(p.read_text())
+                    char_data = data.get("character", {})
+                    name = char_data.get("name", "Unnamed")
+                    saved = data.get("saved_at", "")
+                    sessions.append({
+                        "name": name,
+                        "saved_at": saved,
+                        "path": str(p),
+                        "vessel": char_data.get("vessel", ""),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return sessions
+
+    def load_specific_session(self, path: str) -> Optional[tuple[Character, List[dict], EmbodimentState]]:
+        """Load a specific timestamped session file."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            payload = json.loads(p.read_text())
             char = Character(**payload["character"])
             hist = payload.get("history", [])
             emb = EmbodimentState.from_dict(payload.get("embodiment"))

@@ -856,6 +856,11 @@ class SessionScreen(Screen):
         self.history.append({"role": "user", "content": action})
         event.input.value = ""
         self._update_embodiment_display()
+        try:
+            influences = self._get_attribute_influences(self.app.current_character)
+            self.query_one("#attr_influences", Static).update(Markdown(influences))
+        except Exception:
+            pass
         self._autosave()
         self._get_llm_response_worker()
 

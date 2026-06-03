@@ -133,3 +133,9 @@ Label {
     min-height: 1;
     padding: 0 1;
 }
+
+#embodiment {
+    font-size: 90%;
+    color: #a088aa;
+    margin-bottom: 1;
+}

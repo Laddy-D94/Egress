@@ -201,6 +201,11 @@ class EmbodimentState:
     coherence: int = 10           # 10 solid "I" → 0 dissociation / loss of self
     motor_friction: int = 0       # 0 fluid → high = body feels alien / disobedient
 
+    # Light first-day scaffolding (milestones give the LLM "this is still day one" anchors)
+    sensations_registered: int = 0
+    has_attempted_movement: bool = False
+    has_reached_for_other: bool = False
+
     def process_user_action(self, action: str, char: Character) -> str:
         """Adjust state based on what the player just did / felt. Returns a short atmospheric note."""
         if not action or not char:
@@ -261,6 +266,13 @@ class EmbodimentState:
         if self.qualia_load > 0 and "focus" not in text and "breathe" not in text:
             self.qualia_load = max(0, self.qualia_load - 1) if l >= 6 else self.qualia_load
 
+        # === First-day milestone scaffolding ===
+        self.sensations_registered += 1
+        if any(w in text for w in motor_words):
+            self.has_attempted_movement = True
+        if any(w in text for w in social_words):
+            self.has_reached_for_other = True
+
         # Clamp everything
         self.qualia_load = max(0, min(10, self.qualia_load))
         self.coherence = max(0, min(10, self.coherence))
@@ -288,10 +300,28 @@ class EmbodimentState:
         if self.motor_friction >= 4:
             frags.append(f"Motor Friction {self.motor_friction}/10: The body feels heavy, alien, or only partially under your will. Movement descriptions should carry friction or surprise.")
 
+        # First day scaffolding hooks (keeps the "sacred first day" promise alive)
+        phase_notes = []
+        if self.sensations_registered < 4:
+            phase_notes.append("This is among the very first coherent moments of having a body.")
+        if not self.has_attempted_movement:
+            phase_notes.append("You have not yet tried to move any part of this new form.")
+        if not self.has_reached_for_other:
+            phase_notes.append("No other mind has yet impinged on yours.")
+        if phase_notes:
+            frags.append("First Day Context: " + " ".join(phase_notes))
+
         return "\n".join(frags)
 
     def as_dict(self) -> dict:
-        return {"qualia_load": self.qualia_load, "coherence": self.coherence, "motor_friction": self.motor_friction}
+        return {
+            "qualia_load": self.qualia_load,
+            "coherence": self.coherence,
+            "motor_friction": self.motor_friction,
+            "sensations_registered": self.sensations_registered,
+            "has_attempted_movement": self.has_attempted_movement,
+            "has_reached_for_other": self.has_reached_for_other,
+        }
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "EmbodimentState":
@@ -301,6 +331,9 @@ class EmbodimentState:
             qualia_load=d.get("qualia_load", 0),
             coherence=d.get("coherence", 10),
             motor_friction=d.get("motor_friction", 0),
+            sensations_registered=d.get("sensations_registered", 0),
+            has_attempted_movement=d.get("has_attempted_movement", False),
+            has_reached_for_other=d.get("has_reached_for_other", False),
         )
 
 
@@ -561,6 +594,16 @@ class SessionScreen(Screen):
             ]
             if e.motor_friction > 0:
                 lines.append(f"Motor Friction: {bar(e.motor_friction, 8)} {e.motor_friction}/8")
+            # Scaffolding hint in UI
+            phase = []
+            if e.sensations_registered > 0:
+                phase.append(f"~{e.sensations_registered} moments")
+            if e.has_attempted_movement:
+                phase.append("moved")
+            if e.has_reached_for_other:
+                phase.append("reached")
+            if phase:
+                lines.append("[dim]Day One: " + " · ".join(phase) + "[/dim]")
             w.update("\n".join(lines))
         except Exception:
             pass

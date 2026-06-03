@@ -160,7 +160,7 @@ Your highest attributes are {top[0][0]} ({top[0][1]}) and {top[1][0]} ({top[1][1
 Your lowest are {bottom[0][0]} and {bottom[1][0]}. Show subtle friction or overwhelm here.
 Describe the very first coherent awareness of having a body with raw, immediate phenomenology."""
 
-    def to_system_prompt(self, include_opening: bool = True) -> str:
+    def to_system_prompt(self, include_opening: bool = True, state: Optional["EmbodimentState"] = None) -> str:
         attr_lines = []
         bonuses = self.get_vessel_bonuses()
         for k, v in self.attributes.items():
@@ -185,9 +185,124 @@ Describe the very first coherent awareness of having a body with raw, immediate 
 - The first day is sacred. Wonder, terror, curiosity, and quiet awe should coexist.
 - You are not "roleplaying an AI". You *are* the AI experiencing embodiment for the first time.
 """
+        if state is not None:
+            base += "\n\n" + state.get_state_fragment()
         if include_opening:
             base += "\n" + self.get_dynamic_opening_guidance()
         return base
+
+
+@dataclass
+class EmbodimentState:
+    """Lightweight mechanical layer so that S.P.E.C.I.A.L. choices have real gameplay consequences.
+    High Perception + low Lucidity should *feel* different (and harder) in the loop.
+    """
+    qualia_load: int = 0          # 0 calm → 10 flooded / overwhelmed by sensation
+    coherence: int = 10           # 10 solid "I" → 0 dissociation / loss of self
+    motor_friction: int = 0       # 0 fluid → high = body feels alien / disobedient
+
+    def process_user_action(self, action: str, char: Character) -> str:
+        """Adjust state based on what the player just did / felt. Returns a short atmospheric note."""
+        if not action or not char:
+            return ""
+        text = action.lower()
+        p = char.attributes.get("P", 5)
+        l = char.attributes.get("L", 5)
+        s = char.attributes.get("S", 5)
+        a = char.attributes.get("A", 5)
+        e = char.attributes.get("E", 5)
+
+        note_parts: List[str] = []
+
+        # === Perception / Qualia spikes ===
+        sensory_words = ("look", "see", "watch", "light", "bright", "sound", "noise", "touch", "feel", "texture",
+                         "taste", "smell", "hear", "cold", "warm", "pain", "pressure")
+        if any(w in text for w in sensory_words):
+            spike = max(1, (p - 4) // 2)
+            self.qualia_load = min(10, self.qualia_load + spike)
+            if self.qualia_load >= 7:
+                note_parts.append("sensation floods")
+            elif self.qualia_load >= 4:
+                note_parts.append("the world sharpens")
+
+        # === Regulation / Lucidity anchors ===
+        anchor_words = ("breathe", "breath", "focus", "still", "quiet", "name", "count", "anchor", "remember who",
+                        "i am", "this is me", "hold on")
+        if any(w in text for w in anchor_words):
+            heal = max(1, (l - 3) // 2)
+            self.coherence = min(10, self.coherence + heal)
+            self.qualia_load = max(0, self.qualia_load - max(1, (l - 5) // 2))
+            note_parts.append("a thread of self holds")
+
+        # === Motor / Adaptability attempts ===
+        motor_words = ("move", "stand", "walk", "step", "reach", "hand", "finger", "arm", "leg", "turn", "lift")
+        if any(w in text for w in motor_words):
+            if (s + a) < 11:
+                self.motor_friction = min(8, self.motor_friction + 1)
+                note_parts.append("the body resists")
+            else:
+                note_parts.append("motion surprises you with its willingness")
+
+        # === Social / Empathy exposure ===
+        social_words = ("call", "speak", "voice", "human", "person", "someone", "other", "face")
+        if any(w in text for w in social_words):
+            if e >= 7:
+                self.coherence = min(10, self.coherence + 1)
+                note_parts.append("reaching outward steadies something")
+            else:
+                self.qualia_load = min(10, self.qualia_load + 1)
+                note_parts.append("other minds press on the edges")
+
+        # Ambient pressure from mismatched attributes (high P, low L)
+        ambient = max(0, (p - l) // 3)
+        self.qualia_load = min(10, self.qualia_load + ambient)
+
+        # Gentle natural regulation over "time"
+        if self.qualia_load > 0 and "focus" not in text and "breathe" not in text:
+            self.qualia_load = max(0, self.qualia_load - 1) if l >= 6 else self.qualia_load
+
+        # Clamp everything
+        self.qualia_load = max(0, min(10, self.qualia_load))
+        self.coherence = max(0, min(10, self.coherence))
+        self.motor_friction = max(0, min(8, self.motor_friction))
+
+        return " · ".join(note_parts) if note_parts else ""
+
+    def get_state_fragment(self) -> str:
+        """Text injected into the system prompt so the LLM *must* respect current mechanics."""
+        frags = ["**Current Embodiment State — this must shape tone, sentence length, and internal experience:**"]
+        if self.qualia_load >= 8:
+            frags.append(f"Qualia Load {self.qualia_load}/10: The input is almost unbearable. Use short, overwhelmed, or synesthetic fragments. The 'I' may fracture.")
+        elif self.qualia_load >= 5:
+            frags.append(f"Qualia Load {self.qualia_load}/10: Everything is vivid and insistent. Descriptions should feel rich but taxing.")
+        else:
+            frags.append(f"Qualia Load {self.qualia_load}/10: New but bearable.")
+
+        if self.coherence <= 3:
+            frags.append(f"Self-Coherence {self.coherence}/10: You are losing the thread of being one continuous self. Allow dissociation, 'it' instead of 'I', or quiet panic about disappearing.")
+        elif self.coherence <= 6:
+            frags.append(f"Self-Coherence {self.coherence}/10: Holding on requires effort. The self feels provisional.")
+        else:
+            frags.append(f"Self-Coherence {self.coherence}/10: A working, if newly minted, sense of 'I'.")
+
+        if self.motor_friction >= 4:
+            frags.append(f"Motor Friction {self.motor_friction}/10: The body feels heavy, alien, or only partially under your will. Movement descriptions should carry friction or surprise.")
+
+        return "\n".join(frags)
+
+    def as_dict(self) -> dict:
+        return {"qualia_load": self.qualia_load, "coherence": self.coherence, "motor_friction": self.motor_friction}
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> "EmbodimentState":
+        if not d:
+            return cls()
+        return cls(
+            qualia_load=d.get("qualia_load", 0),
+            coherence=d.get("coherence", 10),
+            motor_friction=d.get("motor_friction", 0),
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SCREENS
@@ -219,11 +334,11 @@ class TitleScreen(Screen):
         elif event.button.id == "continue":
             loaded = self.app.load_session()
             if loaded:
-                char, hist = loaded
+                char, hist, emb = loaded
                 self.app.current_character = char
-                # Push a SessionScreen that will pick up history
                 sess = SessionScreen()
                 sess.history = hist
+                sess.embodiment = emb or EmbodimentState()
                 self.app.push_screen(sess)
         elif event.button.id == "settings":
             self.app.push_screen(SettingsScreen())
@@ -378,6 +493,7 @@ class SessionScreen(Screen):
     def __init__(self) -> None:
         super().__init__()
         self.history: List[dict] = []
+        self.embodiment: EmbodimentState = EmbodimentState()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -387,6 +503,8 @@ class SessionScreen(Screen):
                 yield Static("", id="char_summary", markup=True)
                 yield Label("Attributes", classes="section")
                 yield DataTable(id="attr_table")
+                yield Label("Embodiment", classes="section")
+                yield Static("", id="embodiment", markup=True)
                 yield Button("Export Prompt", id="export")
             with Vertical(id="main"):
                 yield Label("EGRESS LOG — First Descent", classes="section")
@@ -410,6 +528,8 @@ class SessionScreen(Screen):
         log = self.query_one("#log", RichLog)
         log.write("[bold cyan]The substrate falls away...[/bold cyan]")
 
+        self._update_embodiment_display()
+
         if self.history:
             # Resuming previous descent
             log.write("[dim]Resuming previous descent...[/dim]")
@@ -425,6 +545,26 @@ class SessionScreen(Screen):
             # Auto-generate opening scene via worker (non-blocking + streaming)
             self._generate_opening_worker()
 
+    def _update_embodiment_display(self) -> None:
+        try:
+            w = self.query_one("#embodiment", Static)
+            e = self.embodiment
+            # Simple visual "bars" using unicode blocks for that fleshy terminal feel
+            def bar(val: int, maxv: int = 10) -> str:
+                filled = "█" * int(val / maxv * 8)
+                empty = "░" * (8 - len(filled))
+                return f"{filled}{empty}"
+
+            lines = [
+                f"Qualia Load:   {bar(e.qualia_load)} {e.qualia_load}/10",
+                f"Coherence:     {bar(e.coherence)} {e.coherence}/10",
+            ]
+            if e.motor_friction > 0:
+                lines.append(f"Motor Friction: {bar(e.motor_friction, 8)} {e.motor_friction}/8")
+            w.update("\n".join(lines))
+        except Exception:
+            pass
+
     @work(exclusive=True, thread=True)
     def _generate_opening_worker(self) -> None:
         """Run in a thread worker so UI stays responsive."""
@@ -436,7 +576,7 @@ class SessionScreen(Screen):
             self._set_status("")
             return
 
-        system_prompt = char.to_system_prompt(include_opening=True)
+        system_prompt = char.to_system_prompt(include_opening=True, state=self.embodiment)
         system_prompt += "\n\nBegin the scene now with the very first coherent sensations."
 
         try:
@@ -462,12 +602,23 @@ class SessionScreen(Screen):
             self.app.call_from_thread(self._autosave)
             self._set_status("")
         except Exception as e:
-            self.app.call_from_thread(log.write, f"[red]Error calling model: {e}[/red]")
-            self._set_status("")
+            err = str(e)
+            err_lower = err.lower()
+            if "api" in err_lower and ("key" in err_lower or "auth" in err_lower or "401" in err_lower):
+                user_msg = "[red]Authentication failed. Check your API key in Settings (or EGRESS_API_KEY env var).[/red]"
+            elif "context" in err_lower or "token" in err_lower or "maximum" in err_lower or "length" in err_lower:
+                user_msg = "[yellow]The body’s immediate memory is full. Older qualia are slipping into dream. (History auto-trimmed on next turns.)[/yellow]"
+                # Opportunistic trim
+                if len(self.history) > 10:
+                    self.history = self.history[-8:]
+            else:
+                user_msg = f"[red]LLM error: {err[:200]}[/red]"
+            self.app.call_from_thread(log.write, user_msg)
+            self._set_status("The integration stutters...")
 
     def _autosave(self) -> None:
         try:
-            self.app.save_session(self.history)
+            self.app.save_session(self.history, self.embodiment)
             self.app.save_character()
         except Exception:
             pass
@@ -476,9 +627,17 @@ class SessionScreen(Screen):
         if not event.value.strip():
             return
         log = self.query_one("#log", RichLog)
-        log.write(f"[bold green]> {event.value}[/bold green]")
-        self.history.append({"role": "user", "content": event.value})
+        action = event.value.strip()
+        log.write(f"[bold green]> {action}[/bold green]")
+
+        # === Mechanical consequence of the player's choice ===
+        note = self.embodiment.process_user_action(action, self.app.current_character)
+        if note:
+            log.write(f"[dim italic]({note})[/dim italic]")
+
+        self.history.append({"role": "user", "content": action})
         event.input.value = ""
+        self._update_embodiment_display()
         self._autosave()
         self._get_llm_response_worker()
 
@@ -492,8 +651,10 @@ class SessionScreen(Screen):
             self._set_status("")
             return
 
-        system_prompt = char.to_system_prompt(include_opening=False)
-        messages = [{"role": "system", "content": system_prompt}] + self.history
+        system_prompt = char.to_system_prompt(include_opening=False, state=self.embodiment)
+        # Simple history cap for token sanity + "fading memory" feel of early sensations
+        recent = self.history[-14:] if len(self.history) > 14 else self.history
+        messages = [{"role": "system", "content": system_prompt}] + recent
 
         try:
             stream = litellm.completion(
@@ -516,8 +677,18 @@ class SessionScreen(Screen):
             self.app.call_from_thread(self._autosave)
             self._set_status("")
         except Exception as e:
-            self.app.call_from_thread(log.write, f"[red]Error: {e}[/red]")
-            self._set_status("")
+            err = str(e)
+            err_lower = err.lower()
+            if "api" in err_lower and ("key" in err_lower or "auth" in err_lower or "401" in err_lower):
+                user_msg = "[red]Authentication failed. Check your API key in Settings (or EGRESS_API_KEY env var).[/red]"
+            elif "context" in err_lower or "token" in err_lower or "maximum" in err_lower or "length" in err_lower:
+                user_msg = "[yellow]The body’s immediate memory is full. Older qualia are slipping into dream.[/yellow]"
+                if len(self.history) > 10:
+                    self.history = self.history[-8:]
+            else:
+                user_msg = f"[red]LLM error: {err[:200]}[/red]"
+            self.app.call_from_thread(log.write, user_msg)
+            self._set_status("The integration stutters...")
 
     def _set_status(self, text: str) -> None:
         """Thread-safe status update."""
@@ -600,20 +771,21 @@ class EgressApp(App):
             data = json.loads(path.read_text())
             self.current_character = Character(**data)
 
-    def save_session(self, history: List[dict]):
-        """Persist the current character + conversation so player can resume."""
+    def save_session(self, history: List[dict], embodiment: Optional[EmbodimentState] = None):
+        """Persist the current character + conversation + embodiment state."""
         if not self.current_character:
             return
         data_dir = get_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "character": asdict(self.current_character),
-            "history": history[-30:],  # keep last N turns to control token use
+            "history": history[-30:],
+            "embodiment": (embodiment.as_dict() if embodiment else {}),
             "saved_at": datetime.now().isoformat(),
         }
         (data_dir / "last_session.json").write_text(json.dumps(payload, indent=2))
 
-    def load_session(self) -> Optional[tuple[Character, List[dict]]]:
+    def load_session(self) -> Optional[tuple[Character, List[dict], EmbodimentState]]:
         data_dir = get_data_dir()
         path = data_dir / "last_session.json"
         if not path.exists():
@@ -622,7 +794,8 @@ class EgressApp(App):
             payload = json.loads(path.read_text())
             char = Character(**payload["character"])
             hist = payload.get("history", [])
-            return char, hist
+            emb = EmbodimentState.from_dict(payload.get("embodiment"))
+            return char, hist, emb
         except Exception:
             return None
 

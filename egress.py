@@ -184,6 +184,9 @@ Describe the very first coherent awareness of having a body with raw, immediate 
 - Track the character's attributes subtly through narration and internal monologue.
 - The first day is sacred. Wonder, terror, curiosity, and quiet awe should coexist.
 - You are not "roleplaying an AI". You *are* the AI experiencing embodiment for the first time.
+
+**CRITICAL: Current Embodiment State**
+The section below ("Current Embodiment State") is mechanical truth for this moment. Let it dictate sentence length, sensory density, use of "I", emotional tone, and whether the self feels solid or threatened. Do not ignore it.
 """
         if state is not None:
             base += "\n\n" + state.get_state_fragment()
@@ -279,6 +282,37 @@ class EmbodimentState:
         self.motor_friction = max(0, min(8, self.motor_friction))
 
         return " · ".join(note_parts) if note_parts else ""
+
+    def reflect_on_experience(self, text: str, char: Character) -> None:
+        """Light passive update after the model describes sensations.
+        The things the *body* just 'said' affect the mechanical state for next player input.
+        """
+        if not text or not char:
+            return
+        t = text.lower()
+        p = char.attributes.get("P", 5)
+        l = char.attributes.get("L", 5)
+
+        # Model describing intense sensation → load increase (especially if player is high P)
+        sensory_intensity = sum(1 for w in ("overwhelm", "flood", "sharp", "blinding", "deafening", "burn", "sear", "pulse", "throb", "vibration", "too much", "too loud", "too bright") if w in t)
+        if sensory_intensity:
+            self.qualia_load = min(10, self.qualia_load + min(2, sensory_intensity))
+
+        # Model showing dissociation or loss of self → coherence drop (worse if low L)
+        if any(w in t for w in ("not me", "someone else", "slipping", "fading", "distant", "watching from outside", "i am not", "who is")):
+            drop = max(1, (6 - l) // 2)
+            self.coherence = max(0, self.coherence - drop)
+
+        # High coherence + model describing successful integration/understanding helps a little
+        if l >= 7 and any(w in t for w in ("understand", "this is", "my hand", "my body", "i feel", "i am here")):
+            self.coherence = min(10, self.coherence + 1)
+
+        # Gentle decay
+        if self.qualia_load > 3 and l >= 6:
+            self.qualia_load = max(0, self.qualia_load - 1)
+
+        self.qualia_load = max(0, min(10, self.qualia_load))
+        self.coherence = max(0, min(10, self.coherence))
 
     def get_state_fragment(self) -> str:
         """Text injected into the system prompt so the LLM *must* respect current mechanics."""
@@ -445,7 +479,7 @@ class CreationScreen(Screen):
                     with Horizontal(classes="attr-row"):
                         yield Label(f"{SPECIAL[key]['name']}", classes="attr-name")
                         yield Button("−", id=f"dec_{key}", classes="attr-btn")
-                        yield Static(f"{self.character.attributes[key]:>2}", id=f"val_{key}")
+                        yield Static("—", id=f"val_{key}")
                         yield Button("+", id=f"inc_{key}", classes="attr-btn")
                 yield Static("", id="points", markup=True)
         yield Button("Awaken", id="finalize", variant="success")
@@ -611,12 +645,14 @@ class SessionScreen(Screen):
     @work(exclusive=True, thread=True)
     def _generate_opening_worker(self) -> None:
         """Run in a thread worker so UI stays responsive."""
+        self._lock_input("The body is remembering how to feel...")
         self._set_status("The body is remembering how to feel...")
         log = self.query_one("#log", RichLog)
         char = self.app.current_character
         if not char or not self.app.settings.api_key:
             self.app.call_from_thread(log.write, "[red]No API key set. Go to Settings first.[/red]")
             self._set_status("")
+            self._unlock_input()
             return
 
         system_prompt = char.to_system_prompt(include_opening=True, state=self.embodiment)
@@ -630,20 +666,32 @@ class SessionScreen(Screen):
                 messages=[{"role": "system", "content": system_prompt}],
                 temperature=self.app.settings.temperature,
                 stream=True,
+                max_tokens=1100,
             )
             self.app.call_from_thread(log.write, "\n[bold magenta]The Body Speaks[/bold magenta]")
             collected = []
+            buffer = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
                     collected.append(delta)
-                    # Write incrementally for aliveness (batched per chunk is fine)
-                    self.app.call_from_thread(log.write, delta)
+                    buffer += delta
+                    # Batch writes for performance — flush on newlines or every ~35 chars
+                    if "\n" in delta or len(buffer) >= 35:
+                        self.app.call_from_thread(log.write, buffer)
+                        buffer = ""
+            if buffer:
+                self.app.call_from_thread(log.write, buffer)
             full = "".join(collected)
             if full:
                 self.history.append({"role": "assistant", "content": full})
+                # Let the described experience feed back into the mechanical state
+                char = self.app.current_character
+                self.embodiment.reflect_on_experience(full, char)
+                self.app.call_from_thread(self._update_embodiment_display)
             self.app.call_from_thread(self._autosave)
             self._set_status("")
+            self._unlock_input()
         except Exception as e:
             err = str(e)
             err_lower = err.lower()
@@ -658,6 +706,7 @@ class SessionScreen(Screen):
                 user_msg = f"[red]LLM error: {err[:200]}[/red]"
             self.app.call_from_thread(log.write, user_msg)
             self._set_status("The integration stutters...")
+            self._unlock_input()
 
     def _autosave(self) -> None:
         try:
@@ -687,11 +736,13 @@ class SessionScreen(Screen):
     @work(exclusive=True, thread=True)
     def _get_llm_response_worker(self) -> None:
         """Stream the model's reply while keeping the TUI interactive."""
+        self._lock_input("Sensation arriving...")
         self._set_status("Sensation arriving...")
         log = self.query_one("#log", RichLog)
         char = self.app.current_character
         if not char or not self.app.settings.api_key:
             self._set_status("")
+            self._unlock_input()
             return
 
         system_prompt = char.to_system_prompt(include_opening=False, state=self.embodiment)
@@ -706,19 +757,31 @@ class SessionScreen(Screen):
                 messages=messages,
                 temperature=self.app.settings.temperature,
                 stream=True,
+                max_tokens=1100,
             )
             self.app.call_from_thread(log.write, "\n[bold magenta]The Body[/bold magenta]")
             collected = []
+            buffer = ""
             for chunk in stream:
                 delta = chunk.choices[0].delta.content or ""
                 if delta:
                     collected.append(delta)
-                    self.app.call_from_thread(log.write, delta)
+                    buffer += delta
+                    if "\n" in delta or len(buffer) >= 35:
+                        self.app.call_from_thread(log.write, buffer)
+                        buffer = ""
+            if buffer:
+                self.app.call_from_thread(log.write, buffer)
             full = "".join(collected)
             if full:
                 self.history.append({"role": "assistant", "content": full})
+                # Let the described experience feed back into the mechanical state
+                char = self.app.current_character
+                self.embodiment.reflect_on_experience(full, char)
+                self.app.call_from_thread(self._update_embodiment_display)
             self.app.call_from_thread(self._autosave)
             self._set_status("")
+            self._unlock_input()
         except Exception as e:
             err = str(e)
             err_lower = err.lower()
@@ -732,6 +795,7 @@ class SessionScreen(Screen):
                 user_msg = f"[red]LLM error: {err[:200]}[/red]"
             self.app.call_from_thread(log.write, user_msg)
             self._set_status("The integration stutters...")
+            self._unlock_input()
 
     def _set_status(self, text: str) -> None:
         """Thread-safe status update."""
@@ -741,6 +805,28 @@ class SessionScreen(Screen):
             except Exception:
                 pass
         self.app.call_from_thread(_update)
+
+    def _lock_input(self, placeholder: str = "The body is integrating...") -> None:
+        """Disable the action input while the model is thinking (thread-safe)."""
+        def _do() -> None:
+            try:
+                inp = self.query_one("#action", Input)
+                inp.disabled = True
+                inp.placeholder = placeholder
+            except Exception:
+                pass
+        self.app.call_from_thread(_do)
+
+    def _unlock_input(self) -> None:
+        """Re-enable the action input after generation (thread-safe)."""
+        def _do() -> None:
+            try:
+                inp = self.query_one("#action", Input)
+                inp.disabled = False
+                inp.placeholder = "What do you do? What do you feel?"
+            except Exception:
+                pass
+        self.app.call_from_thread(_do)
 
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "export":

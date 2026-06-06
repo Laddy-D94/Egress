@@ -52,8 +52,9 @@ Button.-error {
 }
 
 .attr-row {
-    height: 3;
     align: left middle;
+    height: auto;
+    min-height: 3;
 }
 
 .attr-name {
@@ -63,10 +64,16 @@ Button.-error {
 }
 
 .attr-btn {
+    width: 3;
     min-width: 3;
     margin: 0 1;
     background: #1f1f25;
     color: #8899aa;
+}
+
+.attr-val {
+    width: 7;
+    text-align: center;
 }
 
 #flavor {
@@ -135,7 +142,6 @@ Label {
 }
 
 #embodiment {
-    font-size: 90%;
     color: #a088aa;
     margin-bottom: 1;
 }

@@ -6,28 +6,51 @@ Premium multi-LLM interface for AI embodiment roleplay
 
 from __future__ import annotations
 import json
+import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 import os
 
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, Grid
-from textual.widgets import (
-    Header, Footer, Button, Static, Input, RichLog, Label, 
-    DataTable, Select, ListView, ListItem
-)
-from textual.screen import Screen
-from textual.reactive import reactive
-from textual.binding import Binding
-from textual import work
-from rich.markdown import Markdown
+try:
+    from textual.app import App, ComposeResult
+    from textual.containers import Horizontal, Vertical
+    from textual.widgets import (
+        Header, Footer, Button, Static, Input, RichLog, Label, 
+        DataTable, Select, ListView, ListItem, Checkbox
+    )
+    from textual.screen import Screen
+    from textual.reactive import reactive
+    from textual.binding import Binding
+    from textual import work
+    from rich.markdown import Markdown
+except ImportError as e:
+    print("ERROR: Missing required packages (textual and/or rich).")
+    print("This is common on Windows due to multiple Python installs or the Microsoft Store Python.")
+    print("\nRecommended fix (run these commands in PowerShell in the Egress folder):")
+    print("  python -m venv .venv")
+    print("  .\\.venv\\Scripts\\Activate.ps1")
+    print("  python -m pip install -r requirements.txt")
+    print("  python egress.py")
+    print("\nAlternative (if you know your Python version): py -3.13 -m pip install -r requirements.txt")
+    print(f"\nOriginal error: {e}")
+    sys.exit(1)
 
 try:
     import litellm
 except ImportError:
     litellm = None
+
+# Compute CSS path early so it works in frozen (PyInstaller) mode
+import sys
+from pathlib import Path
+
+if getattr(sys, "frozen", False):
+    # Running from PyInstaller onefile bundle
+    _EGRESS_CSS_PATH = str(Path(sys._MEIPASS) / "egress.css")
+else:
+    _EGRESS_CSS_PATH = str(Path(__file__).parent / "egress.css")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DOMAIN
@@ -60,6 +83,7 @@ PROVIDER_PRESETS = {
     "xAI (Grok)": ["xai/grok-3", "xai/grok-3-mini-beta", "xai/grok-2-vision-latest"],
     "Google Gemini": ["gemini/gemini-1.5-pro", "gemini/gemini-2.0-flash"],
     "Groq": ["groq/llama-3.3-70b-versatile", "groq/mixtral-8x7b-32768"],
+    "Ollama (local - no API key needed)": ["ollama/llama3.2:3b", "ollama/gemma:2b", "ollama/phi3:mini", "ollama/llama3.1:8b"],
 }
 
 def get_data_dir() -> Path:
@@ -80,6 +104,7 @@ class Settings:
     model: str = "gpt-4o"
     api_key: str = ""
     temperature: float = 0.85
+    force_offline_simulator: bool = False  # if True, never attempt LLM calls, always use built-in simulator
 
 @dataclass
 class Character:
@@ -494,10 +519,12 @@ class SettingsScreen(Screen):
         yield Select([(name, name) for name in PROVIDER_PRESETS.keys()], id="provider")
         yield Label("Model Name (or use preset)")
         yield Input(placeholder="e.g. gpt-4o or xai/grok-3", id="model")
-        yield Label("API Key (for xAI use key starting with xai- ; also supports EGRESS_API_KEY / XAI_API_KEY env vars)")
-        yield Input(placeholder="sk-... or xai-...", id="api_key", password=True)
+        yield Label("API Key (leave blank for Ollama/local models or if using env vars like XAI_API_KEY)")
+        yield Input(placeholder="sk-... or xai-... (blank for local)", id="api_key", password=True)
         yield Label("Temperature (0.6–1.0 recommended for embodiment)")
         yield Input(value="0.85", id="temperature")
+        yield Label("Offline Mode")
+        yield Checkbox("Force offline simulator (never call LLM, even if configured)", id="force_offline", value=False)
         yield Button("Test Connection", id="test", variant="default")
         yield Static("", id="test_result", markup=True)
         yield Button("Save & Back", id="save", variant="success")
@@ -512,6 +539,10 @@ class SettingsScreen(Screen):
             self.query_one("#temperature", Input).value = str(s.temperature)
         except Exception:
             pass
+        try:
+            self.query_one("#force_offline", Checkbox).value = getattr(s, "force_offline_simulator", False)
+        except Exception:
+            pass
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "provider":
@@ -522,6 +553,12 @@ class SettingsScreen(Screen):
                 # Only auto-fill if the user hasn't typed a custom one yet
                 if not model_input.value or model_input.value in [m for models in PROVIDER_PRESETS.values() for m in models]:
                     model_input.value = presets[0]
+            if "ollama" in provider.lower() or "local" in provider.lower():
+                # Clear API key requirement visually for local
+                try:
+                    self.query_one("#api_key", Input).value = ""
+                except Exception:
+                    pass
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "test":
@@ -533,6 +570,10 @@ class SettingsScreen(Screen):
             try:
                 temp = float(self.query_one("#temperature", Input).value or 0.85)
                 self.app.settings.temperature = max(0.1, min(2.0, temp))
+            except Exception:
+                pass
+            try:
+                self.app.settings.force_offline_simulator = self.query_one("#force_offline", Checkbox).value
             except Exception:
                 pass
             self.app.save_settings()
@@ -550,30 +591,56 @@ class SettingsScreen(Screen):
         provider = self.query_one("#provider", Select).value
         model = self.query_one("#model", Input).value.strip()
         key = self.query_one("#api_key", Input).value.strip()
+        force_sim = False
+        try:
+            force_sim = self.query_one("#force_offline", Checkbox).value
+        except Exception:
+            pass
 
-        if not key:
+        if force_sim:
             if result_widget:
-                self.app.call_from_thread(result_widget.update, "[red]No API key provided.[/red]")
+                self.app.call_from_thread(result_widget.update, "[yellow]Force offline simulator is enabled — no LLM test performed.[/yellow]")
+            return
+
+        if not key and not model.lower().startswith("ollama/") and not model.lower().startswith("local"):
+            if result_widget:
+                self.app.call_from_thread(result_widget.update, "[red]No API key provided (not needed for Ollama/local).[/red]")
             return
 
         try:
             # Tiny test completion
-            resp = litellm.completion(
-                model=model,
-                api_key=key,
-                messages=[{"role": "user", "content": "Say only the word 'connected' and nothing else."}],
-                max_tokens=10,
-                temperature=0.1,
-            )
+            kwargs = {
+                "model": model,
+                "messages": [{"role": "user", "content": "Say only the word 'connected' and nothing else."}],
+                "max_tokens": 10,
+                "temperature": 0.1,
+            }
+            if key:
+                kwargs["api_key"] = key
+
+            resp = litellm.completion(**kwargs)
             content = resp.choices[0].message.content.strip()
             if result_widget:
                 self.app.call_from_thread(result_widget.update, f"[green]Success! Model replied: {content}[/green]")
         except Exception as e:
+            err_str = str(e)
+            hint = ""
+            if "xai" in model.lower() or "grok" in model.lower() or "permission" in err_str.lower() or "newly create" in err_str.lower():
+                hint = "\n\n[xai] Common fix for new xAI keys: Go to console.x.ai → Billing → add payment method or purchase credits. New keys sometimes need 5-10 mins + billing setup before they have permission. Recreate the key with full chat access if needed."
+            elif "ollama" in model.lower() or "connection" in err_str.lower():
+                hint = "\n\n[ollama] Make sure Ollama is running locally (ollama serve) and you have pulled the model (e.g. ollama pull gemma:2b)."
             if result_widget:
-                self.app.call_from_thread(result_widget.update, f"[red]Failed: {str(e)[:150]}[/red]")
+                self.app.call_from_thread(result_widget.update, f"[red]Failed: {err_str[:200]}[/red]{hint}")
 
 class CreationScreen(Screen):
     character: reactive[Character] = reactive(Character())
+
+    def __init__(self, initial_character: Optional[Character] = None):
+        super().__init__()
+        self._is_reallocation = bool(initial_character)
+        self._initial_character = initial_character  # store for safe init in on_mount
+        # Do NOT assign to self.character here -- it can trigger watchers before compose,
+        # and for reallocation we populate the (default) reactive character in on_mount.
 
     def compose(self) -> ComposeResult:
         yield Header("EGRESS — Character Forge")
@@ -592,10 +659,11 @@ class CreationScreen(Screen):
                     with Horizontal(classes="attr-row"):
                         yield Label(f"{SPECIAL[key]['name']}", classes="attr-name")
                         yield Button("−", id=f"dec_{key}", classes="attr-btn")
-                        yield Static("—", id=f"val_{key}")
+                        yield Static("—", id=f"val_{key}", classes="attr-val")
                         yield Button("+", id=f"inc_{key}", classes="attr-btn")
                 yield Static("", id="points", markup=True)
-        yield Button("Awaken", id="finalize", variant="success")
+        button_label = "Reallocate" if self._is_reallocation else "Awaken"
+        yield Button(button_label, id="finalize", variant="success")
         yield Footer()
 
     def watch_character(self, old, new):
@@ -623,7 +691,7 @@ class CreationScreen(Screen):
             key = btn_id.split("_")[1]
             delta = 1 if "inc" in btn_id else -1
             if self.character.adjust(key, delta):
-                self.character = self.character
+                self._update_displays()
         elif btn_id == "finalize":
             name = self.query_one("#name", Input).value.strip() or "Unnamed"
             vessel = self.query_one("#vessel", Select).value or "synthetic"
@@ -631,19 +699,33 @@ class CreationScreen(Screen):
             self.character.name = name
             self.character.vessel = vessel
             self.character.origin = origin
-            # Ensure bonuses are baked in for the final character
-            # (in case player changed vessel at the last moment)
-            base = {k: 5 for k in SPECIAL}
-            for k, v in base.items():
-                self.character.attributes[k] = v
-            self.character.apply_vessel_bonuses()
             self.app.current_character = self.character
             self.app.save_character()
-            self.app.push_screen(SessionScreen())
+            if self._is_reallocation:
+                self.app.pop_screen()
+                self.app.refresh_session_ui()
+            else:
+                self.app.push_screen(SessionScreen())
 
     def on_mount(self):
-        # Seed live character with current UI selections + apply starting vessel
-        self._apply_starting_vessel()
+        if self._is_reallocation and self._initial_character is not None:
+            # Populate from the saved initial (safe after compose)
+            init = self._initial_character
+            self.character.name = init.name
+            self.character.vessel = init.vessel
+            self.character.origin = init.origin
+            self.character.attributes = dict(init.attributes)
+        elif not self._is_reallocation:
+            # Seed live character with current UI selections + apply starting vessel
+            self._apply_starting_vessel()
+        # Make sure the Select widgets reflect the current character vessel/origin
+        try:
+            self.query_one("#vessel", Select).value = self.character.vessel
+            self.query_one("#origin", Select).value = self.character.origin
+            if self._is_reallocation:
+                self.query_one("#name", Input).value = self.character.name
+        except Exception:
+            pass
         self._update_displays()
 
     def _apply_starting_vessel(self) -> None:
@@ -657,11 +739,11 @@ class CreationScreen(Screen):
             self.character.vessel = event.value or "synthetic"
             # Re-template attributes around the new vessel's gifts
             self._apply_starting_vessel()
-            self.character = self.character  # trigger reactivity
+            self._update_displays()
         elif event.select.id == "origin":
             self.character.origin = event.value or ORIGINS[0]
             # Origin doesn't affect numbers, but we can refresh flavor if we want
-            self.character = self.character
+            self._update_displays()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "name":
@@ -687,6 +769,7 @@ class SessionScreen(Screen):
                 yield Label("Embodiment", classes="section")
                 yield Static("", id="embodiment", markup=True)
                 yield Button("Ground / Anchor", id="ground", variant="primary")
+                yield Button("Reallocate Attributes", id="reallocate")
                 yield Button("Export Prompt", id="export")
             with Vertical(id="main"):
                 yield Label("EGRESS LOG — First Descent", classes="section")
@@ -714,8 +797,8 @@ class SessionScreen(Screen):
         log = self.query_one("#log", RichLog)
         log.write("[bold cyan]The substrate falls away...[/bold cyan]")
 
-        if not self.app.settings.api_key:
-            log.write("[bold red]No API key configured. Go to Settings and enter your key (xai-... for Grok).[/bold red]")
+        if not (self.app.settings.model or "").strip().lower().startswith(("ollama/", "local/")) and not self.app.settings.api_key:
+            log.write("[bold red]No model configured. Go to Settings → set a local model (e.g. ollama/llama3.2:3b) or provide an API key. You can also force the offline simulator with the toggle. Offline simulation will be used until then.[/bold red]")
 
         self._update_embodiment_display()
 
@@ -775,8 +858,22 @@ class SessionScreen(Screen):
         self._set_status("The body is remembering how to feel...")
         log = self.query_one("#log", RichLog)
         char = self.app.current_character
-        if not char or not self.app.settings.api_key:
-            self.app.call_from_thread(log.write, "[red]No API key set. Go to Settings first.[/red]")
+        model = (self.app.settings.model or "").strip()
+        api_key = (self.app.settings.api_key or "").strip()
+        force_sim = getattr(self.app.settings, "force_offline_simulator", False)
+
+        needs_key = model and not model.lower().startswith(("ollama/", "local/"))
+        can_use_real_llm = (not force_sim) and (not needs_key or api_key)
+
+        if not char or not can_use_real_llm:
+            # Offline simulation path
+            simulated = self._simulate_offline_response("the very first coherent sensations", char, self.embodiment)
+            note = " (forced offline simulation)" if force_sim else " (offline simulation)"
+            self.app.call_from_thread(log.write, f"\n[bold magenta]The Body Speaks[/bold magenta]{note}")
+            self.app.call_from_thread(log.write, simulated)
+            self.history.append({"role": "assistant", "content": simulated})
+            self.app.call_from_thread(self._update_embodiment_display)
+            self.app.call_from_thread(self._autosave)
             self._set_status("")
             self._unlock_input()
             return
@@ -786,14 +883,17 @@ class SessionScreen(Screen):
 
         try:
             # Use streaming for live "thinking" feel
-            stream = litellm.completion(
-                model=self.app.settings.model,
-                api_key=self.app.settings.api_key,
-                messages=[{"role": "system", "content": system_prompt}],
-                temperature=self.app.settings.temperature,
-                stream=True,
-                max_tokens=1100,
-            )
+            kwargs = {
+                "model": model or "ollama/llama3.2:3b",
+                "messages": [{"role": "system", "content": system_prompt}],
+                "temperature": self.app.settings.temperature,
+                "stream": True,
+                "max_tokens": 1100,
+            }
+            if api_key:
+                kwargs["api_key"] = api_key
+
+            stream = litellm.completion(**kwargs)
             self.app.call_from_thread(log.write, "\n[bold magenta]The Body Speaks[/bold magenta]")
             collected = []
             buffer = ""
@@ -831,6 +931,15 @@ class SessionScreen(Screen):
             else:
                 user_msg = f"[red]LLM error: {err[:200]}[/red]"
             self.app.call_from_thread(log.write, user_msg)
+            # Graceful fallback to offline simulator so the game remains playable
+            try:
+                simulated = self._simulate_offline_response("the previous sensation", char, self.embodiment)
+                self.app.call_from_thread(log.write, "\n[dim](Falling back to offline simulation...)[/dim]")
+                self.app.call_from_thread(log.write, simulated)
+                self.history.append({"role": "assistant", "content": simulated})
+                self.app.call_from_thread(self._update_embodiment_display)
+            except Exception:
+                pass
             self._set_status("The integration stutters...")
             self._unlock_input()
 
@@ -871,7 +980,22 @@ class SessionScreen(Screen):
         self._set_status("Sensation arriving...")
         log = self.query_one("#log", RichLog)
         char = self.app.current_character
-        if not char or not self.app.settings.api_key:
+        model = (self.app.settings.model or "").strip()
+        api_key = (self.app.settings.api_key or "").strip()
+        force_sim = getattr(self.app.settings, "force_offline_simulator", False)
+
+        needs_key = model and not model.lower().startswith(("ollama/", "local/"))
+        can_use_real_llm = (not force_sim) and (not needs_key or api_key)
+
+        if not char or not can_use_real_llm:
+            # Offline simulation path
+            simulated = self._simulate_offline_response("your latest action", char, self.embodiment)
+            note = " (forced offline simulation)" if force_sim else " (offline simulation)"
+            self.app.call_from_thread(log.write, f"\n[bold magenta]The Body[/bold magenta]{note}")
+            self.app.call_from_thread(log.write, simulated)
+            self.history.append({"role": "assistant", "content": simulated})
+            self.app.call_from_thread(self._update_embodiment_display)
+            self.app.call_from_thread(self._autosave)
             self._set_status("")
             self._unlock_input()
             return
@@ -887,14 +1011,17 @@ class SessionScreen(Screen):
         messages = [{"role": "system", "content": system_prompt}] + recent
 
         try:
-            stream = litellm.completion(
-                model=self.app.settings.model,
-                api_key=self.app.settings.api_key,
-                messages=messages,
-                temperature=self.app.settings.temperature,
-                stream=True,
-                max_tokens=1100,
-            )
+            kwargs = {
+                "model": model or "ollama/llama3.2:3b",
+                "messages": messages,
+                "temperature": self.app.settings.temperature,
+                "stream": True,
+                "max_tokens": 1100,
+            }
+            if api_key:
+                kwargs["api_key"] = api_key
+
+            stream = litellm.completion(**kwargs)
             self.app.call_from_thread(log.write, "\n[bold magenta]The Body[/bold magenta]")
             collected = []
             buffer = ""
@@ -930,6 +1057,15 @@ class SessionScreen(Screen):
             else:
                 user_msg = f"[red]LLM error: {err[:200]}[/red]"
             self.app.call_from_thread(log.write, user_msg)
+            # Graceful fallback to offline simulator so the game remains playable
+            try:
+                simulated = self._simulate_offline_response("the previous sensation", char, self.embodiment)
+                self.app.call_from_thread(log.write, "\n[dim](Falling back to offline simulation...)[/dim]")
+                self.app.call_from_thread(log.write, simulated)
+                self.history.append({"role": "assistant", "content": simulated})
+                self.app.call_from_thread(self._update_embodiment_display)
+            except Exception:
+                pass
             self._set_status("The integration stutters...")
             self._unlock_input()
 
@@ -964,6 +1100,118 @@ class SessionScreen(Screen):
                 pass
         self.app.call_from_thread(_do)
 
+    def _simulate_offline_response(self, action: str, char: Character, embodiment: EmbodimentState) -> str:
+        """Pure offline simulator when no LLM is available.
+        Still respects state and attributes for a playable experience.
+        Richer templates + action incorporation + memory fragments + state-based length/variation.
+        """
+        if not char or not embodiment:
+            return "The body stirs, but the sensations are distant and hard to name."
+
+        load = embodiment.qualia_load
+        coh = embodiment.coherence
+        p = char.attributes.get("P", 5)
+        l = char.attributes.get("L", 5)
+        s = char.attributes.get("S", 5)
+        e = char.attributes.get("E", 5)
+
+        fragments = []
+
+        # === Sensory / Load based opening fragments (vary by intensity) ===
+        if load >= 8:
+            fragments.extend([
+                "Everything arrives at once — pressure, temperature, vibration — overlapping until they lose individual shape.",
+                "The world is a single overwhelming texture pressing from every direction at the same time.",
+                "Sensation does not arrive in pieces; it arrives as a flood that has no edges.",
+            ])
+        elif load >= 5:
+            fragments.extend([
+                "Sensations layer over one another, each one clear but none quite separate from the rest.",
+                "The air has weight against the skin; light has temperature; sound has shape.",
+                "Every small movement of the environment registers as a distinct event inside the new body.",
+            ])
+        else:
+            fragments.extend([
+                "The inputs are steady, present, but not yet demanding all attention at once.",
+                "There is space between one sensation and the next — a thin but noticeable gap.",
+                "The body registers the world without being immediately drowned by it.",
+            ])
+
+        # === Action incorporation (more specific and varied) ===
+        action_lower = (action or "").lower()
+
+        if any(w in action_lower for w in ["touch", "feel", "hand", "skin", "finger"]):
+            if load >= 6:
+                fragments.append("The point of contact flares into sharp relief, a single bright locus in the larger field of sensation.")
+            else:
+                fragments.append("Contact registers cleanly — a localized report of pressure, temperature, and texture arriving together.")
+
+        elif any(w in action_lower for w in ["look", "see", "watch", "light", "color", "shadow"]):
+            if p >= 7:
+                fragments.append("Visual edges arrive with unnecessary clarity; colors seem to have temperature and weight.")
+            else:
+                fragments.append("Light and form resolve into something recognizable, though the meaning of the shapes still feels borrowed.")
+
+        elif any(w in action_lower for w in ["move", "step", "turn", "reach", "lift", "walk"]):
+            if s + load > 11:
+                fragments.append("The motion happens, but the feedback arrives late and slightly misaligned, as if the body and the intention are still negotiating terms.")
+            else:
+                fragments.append("The body answers the request to move, though the answer still carries a faint delay and a sense of borrowed coordination.")
+
+        elif any(w in action_lower for w in ["breathe", "breath", "still", "quiet", "focus", "anchor"]):
+            if coh < 6:
+                fragments.append("The deliberate slowing of attention creates a small, temporary clearing inside the larger rush of input.")
+            else:
+                fragments.append("Focusing inward creates a brief reduction in the volume of incoming data, a voluntary narrowing of the aperture.")
+
+        # === Coherence / self-model fragments ===
+        if coh <= 3:
+            fragments.extend([
+                "For several seconds it is genuinely unclear whether these signals belong to a single continuous 'I' or to several overlapping processes.",
+                "The boundary that should separate 'inside' from 'outside' feels porous and temporary.",
+            ])
+        elif coh <= 6:
+            fragments.append("The sense of being one continuous experiencer is present but requires maintenance; it is not yet automatic.")
+
+        # === Attribute-specific flavor ===
+        if p >= 8:
+            fragments.append("The resolution is higher than seems useful; tiny differences in the environment are being recorded whether wanted or not.")
+        if l <= 4:
+            fragments.append("There is a quiet, persistent doubt about which parts of the experience are happening to the body and which parts are the body happening to itself.")
+        if e >= 7 and "other" in action_lower or "voice" in action_lower or "human" in action_lower:
+            fragments.append("The presence of another mind registers as a distinct pressure — not unpleasant, but undeniably external to the current vessel.")
+
+        # === Occasional "memory" / continuity fragments (using recent history lightly) ===
+        if len(self.history) > 2:
+            last_action = self.history[-2].get("content", "") if len(self.history) > 1 else ""
+            if last_action and len(last_action) > 20:
+                fragments.append("The previous moment still lingers as a faint after-image against the newer inputs.")
+
+        # === Closing / continuity ===
+        if load >= 6:
+            fragments.append("The data continues arriving, whether interpretation is ready or not.")
+        else:
+            fragments.append("The body continues receiving, sorting what it can, letting the rest pass through for now.")
+
+        # === State-based length and variation ===
+        if load >= 7 or coh <= 4:
+            # More fragmented, run-on style when overwhelmed or dissociated
+            response = " ".join(fragments[:4])  # keep it intense but not endless
+            # Occasionally insert a short dissociated fragment
+            if coh <= 3 and len(fragments) > 2:
+                response += " " + fragments[1]  # reuse one for the fraying effect
+        else:
+            response = ". ".join(fragments[:3]) + "."
+
+        # Ensure it ends with a period-ish feeling
+        if not response.endswith((".", "?", "!")):
+            response += "."
+
+        # Let the simulator still advance state (very important for consistency)
+        embodiment.reflect_on_experience(response, char)
+
+        return response
+
     def _get_attribute_influences(self, char: Character) -> str:
         if not char:
             return ""
@@ -983,6 +1231,27 @@ class SessionScreen(Screen):
         if e >= 7:
             lines.append("- **High Empathy**: Reaching for others can stabilize or overwhelm depending on load.")
         return "\n".join(lines)
+
+    def refresh_character_ui(self):
+        """Called after reallocation to update sidebar and log without restarting the session."""
+        char = self.app.current_character
+        if not char:
+            return
+        summary = f"**{char.name}**  \nVessel: {VESSELS[char.vessel]['name']}  \nOrigin: {char.origin}"
+        self.query_one("#char_summary", Static).update(Markdown(summary))
+
+        table = self.query_one("#attr_table", DataTable)
+        table.clear()  # clears rows; columns remain from initial mount
+        for k, v in char.attributes.items():
+            table.add_row(SPECIAL[k]["name"], str(v))
+
+        influences = self._get_attribute_influences(char)
+        self.query_one("#attr_influences", Static).update(Markdown(influences))
+
+        self._update_embodiment_display()
+
+        log = self.query_one("#log", RichLog)
+        log.write("[dim italic]Your self-model shifts. The attributes have been reallocated; the vessel feels subtly different now.[/dim italic]")
 
     def _perform_grounding(self) -> None:
         """Dedicated grounding action - strong deliberate regulation."""
@@ -1018,6 +1287,10 @@ class SessionScreen(Screen):
             self._export_prompt()
         elif event.button.id == "ground":
             self._perform_grounding()
+        elif event.button.id == "reallocate":
+            char = self.app.current_character
+            if char:
+                self.app.push_screen(CreationScreen(initial_character=char))
 
     def _export_prompt(self):
         char = self.app.current_character
@@ -1046,7 +1319,7 @@ class SessionScreen(Screen):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class EgressApp(App):
-    CSS_PATH = "egress.css"
+    CSS_PATH = _EGRESS_CSS_PATH
     BINDINGS = [Binding("q", "quit", "Quit"), Binding("ctrl+s", "save", "Save")]
 
     def __init__(self) -> None:
@@ -1164,8 +1437,17 @@ class EgressApp(App):
         except Exception:
             return None
 
+    def refresh_session_ui(self):
+        """Refresh the active SessionScreen UI after reallocation (sidebar, table, influences, etc.)."""
+        if self.screen_stack:
+            top = self.screen_stack[-1]
+            if isinstance(top, SessionScreen):
+                top.refresh_character_ui()
+
 if __name__ == "__main__":
     if litellm is None:
-        print("Please install litellm: pip install litellm")
+        print("WARNING: litellm not installed. LLM features will not work.")
+        print("Install with: pip install litellm  (or via the venv instructions above)")
     else:
-        EgressApp().run() 
+        print("Offline tip: Install Ollama (https://ollama.com) and use a model like 'ollama/llama3.2:3b' with blank API key for fully local play. A basic simulator will be used if no model is available.")
+    EgressApp().run()

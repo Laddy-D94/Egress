@@ -28,29 +28,50 @@ except ImportError:
     print("Installing tiktoken for LLM token counting...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "tiktoken"])
 
-# Try to remove old exe if it exists (common cause of permission errors on Windows if it was running)
+def kill_egress_processes() -> None:
+    """Stop stray Egress.exe instances (common after testing the portable build)."""
+    subprocess.call(
+        ["taskkill", "/F", "/IM", "Egress.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def try_remove_file(path: str, *, attempts: int = 8, pause_s: float = 1.0) -> bool:
+    if not os.path.exists(path):
+        return True
+    for attempt in range(1, attempts + 1):
+        kill_egress_processes()
+        time.sleep(pause_s)
+        try:
+            os.remove(path)
+            return True
+        except PermissionError:
+            print(f"  ...still locked ({attempt}/{attempts}) — close Egress windows if any are open")
+        except Exception as exc:
+            print(f"  ...remove failed: {exc}")
+    return False
+
+
 dist_exe = os.path.join("dist", "Egress.exe")
-if os.path.exists(dist_exe):
-    print("Attempting to remove previous Egress.exe (close any running Egress windows!)...")
-    try:
-        # Try to kill any running Egress.exe processes first
-        subprocess.call(['taskkill', '/F', '/IM', 'Egress.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)  # brief pause for OS to release the file
-        os.remove(dist_exe)
-        print("Previous Egress.exe removed successfully.")
-    except PermissionError:
-        print("WARNING: Could not remove old Egress.exe (file may still be in use by another process or antivirus). Close all Egress windows, wait a few seconds, and try the build again.")
-    except FileNotFoundError:
-        pass  # taskkill not found or no process
-    except Exception as e:
-        print(f"WARNING: Unexpected issue cleaning old exe: {e}")
+dist_exe_new = os.path.join("dist", "Egress_new.exe")
+
+print("Checking for running Egress.exe processes...")
+kill_egress_processes()
+time.sleep(1)
+
+build_name = "Egress"
+if os.path.exists(dist_exe) and not try_remove_file(dist_exe):
+    print("WARNING: dist\\Egress.exe is locked. Building as Egress_new.exe, then swapping.")
+    try_remove_file(dist_exe_new)
+    build_name = "Egress_new"
 
 cmd = [
     sys.executable,
     "-m", "PyInstaller",
     "--clean",
     "--onefile",
-    "--name", "Egress",
+    "--name", build_name,
     "--add-data", "egress.css;.",
     "--console",
     # Collect all of litellm (including its JSON data files like model_prices_and_context_window_backup.json)
@@ -62,6 +83,8 @@ cmd = [
     # Textual + Rich need collect-all (hidden-import alone misses subpackages/data files)
     "--collect-all", "textual",
     "--collect-all", "rich",
+    "--collect-all", "edge_tts",
+    "--collect-all", "pygame",
     # Essential hidden imports for Textual + Rich + our deps
     "--hidden-import", "textual",
     "--hidden-import", "rich",
@@ -86,6 +109,20 @@ cmd = [
 
 print("Running PyInstaller...")
 subprocess.check_call(cmd)
+
+built_exe = os.path.join("dist", f"{build_name}.exe")
+if build_name != "Egress":
+    if try_remove_file(dist_exe):
+        os.replace(built_exe, dist_exe)
+        print("Replaced locked Egress.exe with the new build.")
+    else:
+        print("")
+        print("Build succeeded as dist\\Egress_new.exe")
+        print("Could not overwrite dist\\Egress.exe (still locked).")
+        print("Close ALL Egress windows, then either:")
+        print("  - Delete dist\\Egress.exe manually and rename Egress_new.exe -> Egress.exe")
+        print("  - Or re-run build.bat")
+        sys.exit(0)
 
 print("")
 print("Build complete!")

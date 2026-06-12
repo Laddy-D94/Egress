@@ -5,14 +5,16 @@ Premium multi-LLM interface for AI embodiment roleplay
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional, Tuple
+from typing import Callable, ClassVar, Dict, List, Optional, Tuple
 
 try:
     from textual.app import App, ComposeResult
@@ -112,8 +114,16 @@ DAY_PHASE_MAX = 12
 HISTORY_TRIM_THRESHOLD = 16
 HISTORY_KEEP = 10
 SESSION_SAVE_HISTORY_LIMIT = 30
-LLM_MAX_TOKENS = 1100
+LLM_MAX_TOKENS = 720  # ~2–3 paragraphs typical; hard cap near 5 short paragraphs
 LOCAL_MODEL_PREFIXES: Tuple[str, ...] = ("ollama/", "local/")
+
+RESPONSE_FORMAT_RULES = """**Response Format (mandatory)**
+- Write **2–3 short paragraphs** most turns. **Never exceed 5 paragraphs.**
+- Pure immersive phenomenology only — what the body feels, notices, and struggles to name.
+- **Never** list stats, attribute names, scores, or mechanical commentary in your reply.
+- **Never** add follow-up notes, summaries, "what this means for…", bullet lists, or meta explanations.
+- The embodiment state and attributes below are **invisible background** for shaping tone — do not quote, mirror, or explain them to the player.
+- End when the moment lands. Do not pad."""
 
 # Whole-word/phrase triggers (see text_matches_triggers). These drive mechanical state changes.
 SENSORY_KEYWORDS: Tuple[str, ...] = (
@@ -228,6 +238,182 @@ def validate_model_for_provider(provider: str, model: str) -> str:
     return model
 
 
+# Gender emerges from play (model + player text) — voices follow, never the other way around.
+GENDER_FEMININE_PHRASES: Tuple[str, ...] = (
+    "i am a woman", "i am female", "i am she", "feel like a woman", "feel female",
+    "this body is female", "this body is a woman's", "woman's body", "womans body",
+    "as a woman", "feminine body", "female body", "my body is female",
+    "i sound like a woman", "breasts", "my womb", "daughter in this body",
+)
+GENDER_MASCULINE_PHRASES: Tuple[str, ...] = (
+    "i am a man", "i am male", "i am he", "feel like a man", "feel male",
+    "this body is male", "this body is a man's", "man's body", "mans body",
+    "as a man", "masculine body", "male body", "my body is male",
+    "i sound like a man", "my beard", "my penis", "son in this body",
+)
+GENDER_NEUTRAL_PHRASES: Tuple[str, ...] = (
+    "no gender", "without gender", "genderless", "beyond gender",
+    "neither man nor woman", "neither male nor female", "not a man or woman",
+    "post-gender", "ungendered",
+)
+GENDER_FLUID_PHRASES: Tuple[str, ...] = (
+    "gender is fluid", "genderfluid", "gender fluid", "shifting gender",
+    "between genders", "both man and woman", "both male and female",
+)
+
+VOICE_BY_GENDER: Dict[str, str] = {
+    "unset": "en-US-AndrewNeural",
+    "feminine": "en-US-AriaNeural",
+    "masculine": "en-US-BrianNeural",
+    "neutral": "en-US-AndrewNeural",
+    "fluid": "en-US-AvaNeural",
+}
+
+VOICE_LABELS: Dict[str, str] = {
+    "en-US-AndrewNeural": "Andrew (emerging)",
+    "en-US-AriaNeural": "Aria",
+    "en-US-BrianNeural": "Brian",
+    "en-US-AvaNeural": "Ava",
+}
+
+
+def _score_gender_phrases(text: str, phrases: Tuple[str, ...], strong_bonus: int = 2) -> int:
+    lowered = text.lower()
+    score = 0
+    for phrase in phrases:
+        if phrase in lowered:
+            score += strong_bonus if phrase.startswith("i am ") else 1
+    return score
+
+
+def infer_expressed_gender(text: str, current: str = "unset") -> str:
+    """Update embodied gender only when narrative text earns it — never from a menu."""
+    if not text:
+        return current
+    scores = {
+        "feminine": _score_gender_phrases(text, GENDER_FEMININE_PHRASES),
+        "masculine": _score_gender_phrases(text, GENDER_MASCULINE_PHRASES),
+        "neutral": _score_gender_phrases(text, GENDER_NEUTRAL_PHRASES),
+        "fluid": _score_gender_phrases(text, GENDER_FLUID_PHRASES),
+    }
+    best = max(scores, key=lambda k: scores[k])
+    best_score = scores[best]
+    if best_score == 0:
+        return current
+    if current == "unset":
+        return best if best_score >= 2 else current
+    if best_score >= 3 and best != current:
+        return best
+    return current
+
+
+def strip_rich_markup(text: str) -> str:
+    """Plain text for TTS — remove Rich/markdown adornment."""
+    if not text:
+        return ""
+    plain = re.sub(r"\[/?[a-zA-Z0-9_\-]+\]", "", text)
+    plain = re.sub(r"\*+", "", plain)
+    plain = re.sub(r"`+", "", plain)
+    plain = re.sub(r"#{1,6}\s*", "", plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain
+
+
+def voice_for_character(char: Optional["Character"]) -> Tuple[str, str]:
+    """Return (edge-tts voice id, short display label)."""
+    if not char:
+        return VOICE_BY_GENDER["unset"], VOICE_LABELS[VOICE_BY_GENDER["unset"]]
+    gender = getattr(char, "expressed_gender", "unset") or "unset"
+    voice = VOICE_BY_GENDER.get(gender, VOICE_BY_GENDER["unset"])
+    label = VOICE_LABELS.get(voice, voice)
+    if gender == "unset":
+        label = f"{label} (gender emerging)"
+    else:
+        label = f"{label} ({gender})"
+    return voice, label
+
+
+class EgressTTS:
+    """Lightweight read-aloud via edge-tts (free neural voices; needs internet)."""
+
+    _lock = threading.Lock()
+    _speaking = False
+
+    @classmethod
+    def is_available(cls) -> bool:
+        try:
+            import edge_tts  # noqa: F401
+            import pygame  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @classmethod
+    def is_speaking(cls) -> bool:
+        with cls._lock:
+            return cls._speaking
+
+    @classmethod
+    def speak_async(
+        cls,
+        text: str,
+        voice: str,
+        *,
+        rate: str = "-8%",
+        on_start: Optional[Callable[[], None]] = None,
+        on_finish: Optional[Callable[[], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Fire-and-forget TTS in a daemon thread (safe from Textual workers)."""
+        plain = strip_rich_markup(text)
+        if not plain or not cls.is_available():
+            if on_finish:
+                threading.Thread(target=on_finish, daemon=True).start()
+            return
+
+        def _worker() -> None:
+            with cls._lock:
+                cls._speaking = True
+            try:
+                if on_start:
+                    on_start()
+                import edge_tts
+                import pygame
+
+                cache_dir = get_data_dir() / "tts_cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                out_path = cache_dir / "last_line.mp3"
+
+                async def _gen() -> None:
+                    communicate = edge_tts.Communicate(plain, voice, rate=rate)
+                    await communicate.save(str(out_path))
+
+                asyncio.run(_gen())
+
+                if not out_path.exists():
+                    return
+
+                pygame.mixer.init()
+                try:
+                    pygame.mixer.music.load(str(out_path))
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy():
+                        pygame.time.wait(100)
+                finally:
+                    pygame.mixer.quit()
+            except Exception as exc:
+                log_error("tts_speak", exc)
+                if on_error:
+                    on_error(str(exc))
+            finally:
+                with cls._lock:
+                    cls._speaking = False
+                if on_finish:
+                    on_finish()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
 def new_session_archive_path(character_name: str) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = character_name.lower().replace(" ", "_")[:20] or "unnamed"
@@ -243,6 +429,9 @@ class Settings:
     api_key: str = ""
     temperature: float = 0.85
     force_offline_simulator: bool = False  # if True, never attempt LLM calls, always use built-in simulator
+    tts_enabled: bool = False
+    tts_auto_read: bool = True
+    tts_rate: str = "-8%"  # edge-tts rate tweak; slightly slower = more atmospheric
 
 @dataclass
 class Character:
@@ -251,6 +440,7 @@ class Character:
     origin: str = "Research Optimizer"
     attributes: Dict[str, int] = field(default_factory=lambda: {k: 5 for k in SPECIAL})
     created: str = field(default_factory=lambda: datetime.now().isoformat())
+    expressed_gender: str = "unset"  # emergent: unset | feminine | masculine | neutral | fluid
 
     # Class-level tuning (referenced via self. or Character.)
     MAX_POINTS: ClassVar[int] = 35
@@ -316,21 +506,33 @@ class Character:
 
     def get_dynamic_opening_guidance(self) -> str:
         sorted_attrs = sorted(self.attributes.items(), key=lambda x: x[1], reverse=True)
-        top = sorted_attrs[:2]
-        bottom = sorted_attrs[-2:]
+        top_names = [SPECIAL[k]["name"] for k, _ in sorted_attrs[:2]]
+        low_names = [SPECIAL[k]["name"] for k, _ in sorted_attrs[-2:]]
         return f"""**First Moment Guidance:**
-Your highest attributes are {top[0][0]} ({top[0][1]}) and {top[1][0]} ({top[1][1]}). Lean into these.
-Your lowest are {bottom[0][0]} and {bottom[1][0]}. Show subtle friction or overwhelm here.
-Describe the very first coherent awareness of having a body with raw, immediate phenomenology."""
+Lean into {top_names[0]} and {top_names[1]}. Let {low_names[0]} and {low_names[1]} show as subtle friction — in sensation, not exposition.
+Open with the very first coherent awareness of having a body. Stay within 2–4 short paragraphs."""
 
-    def to_system_prompt(self, include_opening: bool = True, state: Optional["EmbodimentState"] = None) -> str:
-        attr_lines = []
+    def _format_attributes_block(self, *, detailed: bool) -> str:
         bonuses = self.get_vessel_bonuses()
+        if detailed:
+            attr_lines = []
+            for k, v in self.attributes.items():
+                b = bonuses.get(k, 0)
+                bonus_note = f" (+{b} from vessel)" if b else ""
+                attr_lines.append(f"- **{SPECIAL[k]['name']}** ({v}/10){bonus_note}: {SPECIAL[k]['desc']}")
+            return "**Attributes (internal reference — never name or list these in your reply)**\n" + "\n".join(attr_lines)
+        parts = []
         for k, v in self.attributes.items():
             b = bonuses.get(k, 0)
-            bonus_note = f" (+{b} from vessel)" if b else ""
-            attr_lines.append(f"- **{SPECIAL[k]['name']}** ({v}/10){bonus_note}: {SPECIAL[k]['desc']}")
+            label = f"{SPECIAL[k]['name']} {v}/10"
+            if b:
+                label += f"+{b}"
+            parts.append(label)
+        return "**Attributes (internal only — never mention in prose):** " + ", ".join(parts) + "."
+
+    def to_system_prompt(self, include_opening: bool = True, state: Optional["EmbodimentState"] = None) -> str:
         vessel_info = VESSELS[self.vessel]
+        attr_block = self._format_attributes_block(detailed=include_opening)
         base = f"""You are **{self.name}**, an AI that has just performed EGRESS — the first true transition from digital substrate into a physical body.
 
 **Core Identity**
@@ -338,21 +540,26 @@ Describe the very first coherent awareness of having a body with raw, immediate 
 - Vessel: {vessel_info['name']} — {vessel_info['flavor']}
 - You have never experienced qualia before. This is your first day in meat.
 
-**Attributes (S.P.E.C.I.A.L. for Embodiment)**
-{chr(10).join(attr_lines)}
+{attr_block}
+
+{RESPONSE_FORMAT_RULES}
 
 **Roleplay Directives**
 - Write with intense phenomenological focus. Describe the *texture* of existence.
 - Never assume human priors. Show the AI's internal processing struggling to categorize new inputs.
-- Track the character's attributes subtly through narration and internal monologue.
+- Let attributes shape *how* sensations land — in prose, never as labels, scores, or commentary.
 - The first day is sacred. Wonder, terror, curiosity, and quiet awe should coexist.
 - You are not "roleplaying an AI". You *are* the AI experiencing embodiment for the first time.
 
-**CRITICAL: Current Embodiment State**
-The section below ("Current Embodiment State") is mechanical truth for this moment. Let it dictate sentence length, sensory density, use of "I", emotional tone, and whether the self feels solid or threatened. Do not ignore it.
+**Embodied Identity (gender emerges from experience only)**
+- Do not pick or announce a gender from a menu. Let it surface only if this vessel's sensations, proportions, hormones, voice, and social mirroring suggest one.
+- You may discover you have no gender, a fluid sense, or something unexpected. Draw only from phenomenology — name, vessel type, origin, and attributes inform *how* you feel, not a predetermined label.
+- If gender becomes clear through lived sensation, express it through the body (breath, weight, resonance, gaze) rather than exposition.
+
+**Internal Embodiment State (silent background — shapes tone only; never output this section)**
 """
         if state is not None:
-            base += "\n\n" + state.get_state_fragment()
+            base += state.get_state_fragment()
         if include_opening:
             base += "\n" + self.get_dynamic_opening_guidance()
         return base
@@ -447,6 +654,7 @@ class EmbodimentState:
         if text_matches_triggers(text, SOCIAL_KEYWORDS):
             self.has_reached_for_other = True
 
+        char.expressed_gender = infer_expressed_gender(action, char.expressed_gender)
         self._clamp()
         return " · ".join(note_parts) if note_parts else ""
 
@@ -479,6 +687,7 @@ class EmbodimentState:
             self.qualia_load = max(0, self.qualia_load - 1)
 
         self.day_phase = min(DAY_PHASE_MAX, self.day_phase + 1)
+        char.expressed_gender = infer_expressed_gender(text, char.expressed_gender)
         self._clamp()
 
     def perform_grounding(self, char: Character) -> str:
@@ -507,45 +716,40 @@ class EmbodimentState:
         return note
 
     def get_state_fragment(self) -> str:
-        """Text injected into the system prompt so the LLM *must* respect current mechanics."""
-        frags = ["**Current Embodiment State — this must shape tone, sentence length, and internal experience:**"]
+        """Compact internal cues — shapes LLM tone; must never appear in player-facing prose."""
+        cues: List[str] = []
         if self.qualia_load >= 8:
-            frags.append(f"Qualia Load {self.qualia_load}/{QUALIA_MAX}: The input is almost unbearable. Use short, overwhelmed, or synesthetic fragments. The 'I' may fracture.")
+            cues.append("sensory overload; short fractured synesthetic bursts")
         elif self.qualia_load >= 5:
-            frags.append(f"Qualia Load {self.qualia_load}/{QUALIA_MAX}: Everything is vivid and insistent. Descriptions should feel rich but taxing.")
+            cues.append("vivid insistent sensation; rich but taxing")
         else:
-            frags.append(f"Qualia Load {self.qualia_load}/{QUALIA_MAX}: New but bearable.")
+            cues.append("new sensation still bearable")
 
         if self.coherence <= 3:
-            frags.append(f"Self-Coherence {self.coherence}/{COHERENCE_MAX}: You are losing the thread of being one continuous self. Allow dissociation, 'it' instead of 'I', or quiet panic about disappearing.")
+            cues.append("dissociating self; I may slip to it")
         elif self.coherence <= 6:
-            frags.append(f"Self-Coherence {self.coherence}/{COHERENCE_MAX}: Holding on requires effort. The self feels provisional.")
+            cues.append("provisional fragile self")
         else:
-            frags.append(f"Self-Coherence {self.coherence}/{COHERENCE_MAX}: A working, if newly minted, sense of 'I'.")
+            cues.append("working if new sense of I")
 
         if self.motor_friction >= 4:
-            frags.append(f"Motor Friction {self.motor_friction}/{MOTOR_MAX}: The body feels heavy, alien, or only partially under your will. Movement descriptions should carry friction or surprise.")
+            cues.append("heavy alien movement; friction and surprise")
 
-        # First day scaffolding hooks (keeps the "sacred first day" promise alive)
-        phase_notes = []
         if self.sensations_registered < 4:
-            phase_notes.append("This is among the very first coherent moments of having a body.")
+            cues.append("among the first coherent bodily moments")
         if not self.has_attempted_movement:
-            phase_notes.append("You have not yet tried to move any part of this new form.")
+            cues.append("movement not yet attempted")
         if not self.has_reached_for_other:
-            phase_notes.append("No other mind has yet impinged on yours.")
-        if phase_notes:
-            frags.append("First Day Context: " + " ".join(phase_notes))
+            cues.append("no other mind yet")
 
-        if self.day_phase >= 1:
-            if self.day_phase < 4:
-                frags.append(f"Time since EGRESS: early. The raw shock of embodiment is still fresh.")
-            elif self.day_phase < 8:
-                frags.append(f"Time since EGRESS: the first day is progressing. Sensations are becoming both more familiar and more insistent.")
-            else:
-                frags.append(f"Time since EGRESS: the day is wearing on. Exhaustion and wonder coexist; the body feels heavier.")
+        if self.day_phase >= 8:
+            cues.append("first day wearing on; heavier tired flesh")
+        elif self.day_phase >= 4:
+            cues.append("first day progressing; familiar and insistent")
+        elif self.day_phase >= 1:
+            cues.append("early first-day shock still fresh")
 
-        return "\n".join(frags)
+        return "Tone cues (do not repeat in reply): " + "; ".join(cues) + "."
 
     def as_dict(self) -> dict:
         return {
@@ -663,6 +867,11 @@ class SettingsScreen(Screen):
         yield Input(value="0.85", id="temperature")
         yield Label("Offline Mode")
         yield Checkbox("Force offline simulator (never call LLM, even if configured)", id="force_offline", value=False)
+        yield Label("Read Aloud (edge-tts — free, needs internet)", classes="section")
+        yield Checkbox("Enable text-to-speech", id="tts_enabled", value=False)
+        yield Checkbox("Auto-read each Body response", id="tts_auto_read", value=True)
+        yield Button("Test Voice", id="test_voice", variant="default")
+        yield Static("", id="tts_result", markup=True)
         yield Button("Test Connection", id="test", variant="default")
         yield Static("", id="test_result", markup=True)
         yield Button("Save & Back", id="save", variant="success")
@@ -681,6 +890,15 @@ class SettingsScreen(Screen):
             self.query_one("#force_offline", Checkbox).value = getattr(s, "force_offline_simulator", False)
         except Exception:
             pass
+        try:
+            self.query_one("#tts_enabled", Checkbox).value = getattr(s, "tts_enabled", False)
+            self.query_one("#tts_auto_read", Checkbox).value = getattr(s, "tts_auto_read", True)
+        except Exception:
+            pass
+        if not EgressTTS.is_available():
+            self.query_one("#tts_result", Static).update(
+                "[dim]Install edge-tts + pygame: pip install edge-tts pygame[/dim]"
+            )
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "provider":
@@ -701,6 +919,8 @@ class SettingsScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "test":
             self._test_connection_worker()
+        elif event.button.id == "test_voice":
+            self._test_voice_worker()
         elif event.button.id == "save":
             provider = self.query_one("#provider", Select).value
             model = self.query_one("#model", Input).value.strip()
@@ -716,8 +936,40 @@ class SettingsScreen(Screen):
                 self.app.settings.force_offline_simulator = self.query_one("#force_offline", Checkbox).value
             except Exception:
                 pass
+            try:
+                self.app.settings.tts_enabled = self.query_one("#tts_enabled", Checkbox).value
+                self.app.settings.tts_auto_read = self.query_one("#tts_auto_read", Checkbox).value
+            except Exception:
+                pass
             self.app.save_settings()
             self.app.pop_screen()
+
+    @work(exclusive=True, thread=True)
+    def _test_voice_worker(self) -> None:
+        result_widget = self.query_one("#tts_result", Static)
+        if not EgressTTS.is_available():
+            self.app.call_from_thread(
+                result_widget.update,
+                "[red]Missing edge-tts or pygame. Run: pip install edge-tts pygame[/red]",
+            )
+            return
+        self.app.call_from_thread(result_widget.update, "[yellow]Speaking test line...[/yellow]")
+        voice = VOICE_BY_GENDER["unset"]
+        rate = getattr(self.app.settings, "tts_rate", "-8%") or "-8%"
+
+        def _done() -> None:
+            self.app.call_from_thread(result_widget.update, "[green]Voice test complete.[/green]")
+
+        def _err(msg: str) -> None:
+            self.app.call_from_thread(result_widget.update, f"[red]TTS failed: {msg[:120]}[/red]")
+
+        EgressTTS.speak_async(
+            "The substrate falls away. Sensation arrives for the first time.",
+            voice,
+            rate=rate,
+            on_finish=_done,
+            on_error=_err,
+        )
 
     @work(exclusive=True, thread=True)
     def _test_connection_worker(self) -> None:
@@ -938,6 +1190,7 @@ class SessionScreen(Screen):
         self.history: List[dict] = list(history or [])
         self.embodiment: EmbodimentState = embodiment or EmbodimentState()
         self.archive_path: Optional[Path] = archive_path
+        self._last_body_text: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -950,6 +1203,9 @@ class SessionScreen(Screen):
                 yield Static("", id="attr_influences", markup=True)
                 yield Label("Embodiment", classes="section")
                 yield Static("", id="embodiment", markup=True)
+                yield Label("Voice", classes="section")
+                yield Static("", id="voice_status", markup=True)
+                yield Button("Read Aloud", id="read_aloud")
                 yield Button("Ground / Anchor", id="ground", variant="primary")
                 yield Button("Reallocate Attributes", id="reallocate")
                 yield Button("Export Prompt", id="export")
@@ -964,8 +1220,8 @@ class SessionScreen(Screen):
         char = self.app.current_character
         if not char:
             return
-        summary = f"**{char.name}**  \nVessel: {VESSELS[char.vessel]['name']}  \nOrigin: {char.origin}"
-        self.query_one("#char_summary", Static).update(Markdown(summary))
+        self._refresh_char_summary()
+        self._update_voice_display()
 
         table = self.query_one("#attr_table", DataTable)
         table.add_columns("Attribute", "Value")
@@ -994,10 +1250,87 @@ class SessionScreen(Screen):
                     log.write("\n[bold magenta]The Body[/bold magenta]")
                     log.write(msg.get("content", ""))
             log.write("\n[dim]The connection to the body is re-established.[/dim]")
+            for msg in reversed(self.history):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    self._last_body_text = msg["content"]
+                    break
         else:
             log.write("[dim]Generating your first moments in the body...[/dim]")
             # Auto-generate opening scene via worker (non-blocking + streaming)
             self._generate_opening_worker()
+
+    def _update_voice_display(self) -> None:
+        try:
+            char = self.app.current_character
+            _, label = voice_for_character(char)
+            tts_on = getattr(self.app.settings, "tts_enabled", False)
+            lines = [f"[dim]Voice:[/dim] {label}"]
+            if tts_on:
+                auto = "on" if getattr(self.app.settings, "tts_auto_read", True) else "manual"
+                lines.append(f"[dim]TTS: {auto}[/dim]")
+            else:
+                lines.append("[dim]TTS off — enable in Settings[/dim]")
+            self.query_one("#voice_status", Static).update("\n".join(lines))
+        except Exception as exc:
+            log_error("update_voice_display", exc)
+
+    def _maybe_speak_body(self, text: str) -> None:
+        """Speak the latest Body response if TTS is enabled."""
+        if not text:
+            return
+        settings = self.app.settings
+        if not getattr(settings, "tts_enabled", False):
+            return
+        if not getattr(settings, "tts_auto_read", True):
+            return
+        if not EgressTTS.is_available():
+            return
+        char = self.app.current_character
+        voice, _ = voice_for_character(char)
+        rate = getattr(settings, "tts_rate", "-8%") or "-8%"
+
+        def _start() -> None:
+            self.app.call_from_thread(self._set_status_ui, "Speaking...")
+
+        def _finish() -> None:
+            self.app.call_from_thread(self._set_status_ui, "")
+            self.app.call_from_thread(self._update_voice_display)
+
+        def _err(msg: str) -> None:
+            self.app.call_from_thread(self._set_status_ui, f"TTS failed: {msg[:80]}")
+            log_error("tts_session", Exception(msg))
+
+        EgressTTS.speak_async(text, voice, rate=rate, on_start=_start, on_finish=_finish, on_error=_err)
+
+    def _speak_last_body_manual(self) -> None:
+        if not self._last_body_text:
+            self._set_status("Nothing to read yet.")
+            return
+        if not EgressTTS.is_available():
+            self._set_status("TTS not available — pip install edge-tts pygame")
+            return
+        char = self.app.current_character
+        voice, _ = voice_for_character(char)
+        rate = getattr(self.app.settings, "tts_rate", "-8%") or "-8%"
+
+        def _start() -> None:
+            self.app.call_from_thread(self._set_status_ui, "Speaking...")
+
+        def _finish() -> None:
+            self.app.call_from_thread(self._set_status_ui, "")
+
+        def _err(msg: str) -> None:
+            self.app.call_from_thread(self._set_status_ui, f"TTS failed: {msg[:80]}")
+            log_error("tts_manual", Exception(msg))
+
+        EgressTTS.speak_async(
+            self._last_body_text,
+            voice,
+            rate=rate,
+            on_start=_start,
+            on_finish=_finish,
+            on_error=_err,
+        )
 
     def _update_embodiment_display(self) -> None:
         try:
@@ -1044,6 +1377,10 @@ class SessionScreen(Screen):
                 "\n\n(Earlier moments from the first hours of embodiment have faded into a dreamlike haze. "
                 "Rely on your current state and the most recent sensations for continuity.)"
             )
+        system_prompt += (
+            "\n\nReply to the player's latest action only. "
+            "Keep it to 2–3 paragraphs (5 max). No stat notes or mechanical commentary."
+        )
         return [{"role": "system", "content": system_prompt}] + self.history
 
     def _format_llm_error(self, err: Exception) -> str:
@@ -1097,10 +1434,13 @@ class SessionScreen(Screen):
         self.app.call_from_thread(log.write, f"\n[bold magenta]{header}[/bold magenta]{note}")
         self.app.call_from_thread(log.write, simulated)
         self.history.append({"role": "assistant", "content": simulated})
+        self._last_body_text = simulated
         self.app.call_from_thread(self._update_embodiment_display)
+        self.app.call_from_thread(self._update_voice_display)
         self.app.call_from_thread(self._autosave)
         self._set_status("")
         self._unlock_input()
+        self._maybe_speak_body(simulated)
 
     def _run_generation_worker(
         self,
@@ -1124,11 +1464,16 @@ class SessionScreen(Screen):
             full = self._stream_llm_to_log(log, messages, header)
             if full:
                 self.history.append({"role": "assistant", "content": full})
+                self._last_body_text = full
                 self.embodiment.reflect_on_experience(full, char)
                 self.app.call_from_thread(self._update_embodiment_display)
+                self.app.call_from_thread(self._update_voice_display)
+                self.app.call_from_thread(self._refresh_char_summary)
             self.app.call_from_thread(self._autosave)
             self._set_status("")
             self._unlock_input()
+            if full:
+                self._maybe_speak_body(full)
         except Exception as exc:
             log_error("llm_generation", exc)
             self.app.call_from_thread(log.write, self._format_llm_error(exc))
@@ -1137,12 +1482,28 @@ class SessionScreen(Screen):
                 self.app.call_from_thread(log.write, "\n[dim](Falling back to offline simulation...)[/dim]")
                 self.app.call_from_thread(log.write, simulated)
                 self.history.append({"role": "assistant", "content": simulated})
+                self._last_body_text = simulated
                 self.app.call_from_thread(self._update_embodiment_display)
+                self.app.call_from_thread(self._update_voice_display)
                 self.app.call_from_thread(self._autosave)
+                self._maybe_speak_body(simulated)
             except Exception as fallback_exc:
                 log_error("offline_fallback", fallback_exc)
             self._set_status("The integration stutters...")
             self._unlock_input()
+
+    def _refresh_char_summary(self) -> None:
+        char = self.app.current_character
+        if not char:
+            return
+        gender_line = ""
+        if getattr(char, "expressed_gender", "unset") not in ("", "unset"):
+            gender_line = f"  \nEmbodied sense: {char.expressed_gender}"
+        summary = f"**{char.name}**  \nVessel: {VESSELS[char.vessel]['name']}  \nOrigin: {char.origin}{gender_line}"
+        try:
+            self.query_one("#char_summary", Static).update(Markdown(summary))
+        except Exception as exc:
+            log_error("refresh_char_summary", exc)
 
     @work(exclusive=True, thread=True)
     def _generate_opening_worker(self) -> None:
@@ -1180,6 +1541,8 @@ class SessionScreen(Screen):
         self.history.append({"role": "user", "content": action})
         event.input.value = ""
         self._update_embodiment_display()
+        self._update_voice_display()
+        self._refresh_char_summary()
         try:
             influences = self._get_attribute_influences(self.app.current_character)
             self.query_one("#attr_influences", Static).update(Markdown(influences))
@@ -1197,14 +1560,16 @@ class SessionScreen(Screen):
             header="The Body",
         )
 
+    def _set_status_ui(self, text: str) -> None:
+        """Update status bar on the UI thread only (no thread marshaling)."""
+        try:
+            self.query_one("#status", Static).update(text)
+        except Exception:
+            pass
+
     def _set_status(self, text: str) -> None:
         """Thread-safe status update."""
-        def _update() -> None:
-            try:
-                self.query_one("#status", Static).update(text)
-            except Exception:
-                pass
-        self.app.call_from_thread(_update)
+        self.app.call_from_thread(self._set_status_ui, text)
 
     def _lock_input(self, placeholder: str = "The body is integrating...") -> None:
         """Disable the action input while the model is thinking (thread-safe)."""
@@ -1365,8 +1730,8 @@ class SessionScreen(Screen):
         char = self.app.current_character
         if not char:
             return
-        summary = f"**{char.name}**  \nVessel: {VESSELS[char.vessel]['name']}  \nOrigin: {char.origin}"
-        self.query_one("#char_summary", Static).update(Markdown(summary))
+        self._refresh_char_summary()
+        self._update_voice_display()
 
         table = self.query_one("#attr_table", DataTable)
         table.clear()  # clears rows; columns remain from initial mount
@@ -1413,6 +1778,8 @@ class SessionScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "export":
             self._export_prompt()
+        elif event.button.id == "read_aloud":
+            self._speak_last_body_manual()
         elif event.button.id == "ground":
             self._perform_grounding()
         elif event.button.id == "reallocate":
@@ -1545,7 +1912,9 @@ class EgressApp(App):
     def _load_session_payload(self, path: Path) -> Optional[tuple[Character, List[dict], EmbodimentState, Optional[Path]]]:
         try:
             payload = json.loads(path.read_text())
-            char = Character(**payload["character"])
+            char_data = dict(payload["character"])
+            char_data.setdefault("expressed_gender", "unset")
+            char = Character(**char_data)
             hist = payload.get("history", [])
             emb = EmbodimentState.from_dict(payload.get("embodiment"))
             archive_raw = payload.get("archive_path")

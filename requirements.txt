@@ -3,5 +3,7 @@ rich>=13
 litellm>=1.50
 tiktoken>=0.8
 platformdirs>=4.0
+edge-tts>=6.1
+pygame>=2.6
 # Optional but recommended for nicer key storage
 # keyring>=25

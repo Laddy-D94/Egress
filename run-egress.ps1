@@ -1,6 +1,10 @@
 # Egress Quick Launcher (PowerShell)
 # Run: .\run-egress.ps1
 # Opens in a new PowerShell window so errors stay visible.
+#
+# If you see "not digitally signed", use instead:
+#   .\run-egress.bat
+#   .\run-egress.cmd
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPython = Join-Path $scriptDir ".venv\Scripts\python.exe"

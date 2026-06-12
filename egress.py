@@ -28,13 +28,24 @@ try:
     from rich.markdown import Markdown
 except ImportError as e:
     print("ERROR: Missing required packages (textual and/or rich).")
-    print("This is common on Windows due to multiple Python installs or the Microsoft Store Python.")
-    print("\nRecommended fix (run these commands in PowerShell in the Egress folder):")
-    print("  python -m venv .venv")
-    print("  .\\.venv\\Scripts\\Activate.ps1")
-    print("  python -m pip install -r requirements.txt")
-    print("  python egress.py")
-    print("\nAlternative (if you know your Python version): py -3.13 -m pip install -r requirements.txt")
+    if getattr(sys, "frozen", False):
+        print("\nYou are running the packaged Egress.exe, not source code.")
+        print("Do NOT run pip or create a venv in dist\\ — that will not fix this.")
+        print("\nTry instead:")
+        print("  1. Run from source:  cd C:\\Users\\ladri\\Egress")
+        print("                       .\\run-egress.ps1")
+        print("  2. Rebuild the exe:  cd C:\\Users\\ladri\\Egress")
+        print("                       .\\build.bat")
+    else:
+        print("This is common on Windows due to multiple Python installs or the Microsoft Store Python.")
+        print("\nRun these in the PROJECT folder (C:\\Users\\ladri\\Egress), NOT in dist\\:")
+        print("  .\\setup-venv.ps1")
+        print("  .\\run-egress.ps1")
+        print("\nOr manually:")
+        print("  python -m venv .venv")
+        print("  .\\.venv\\Scripts\\Activate.ps1")
+        print("  python -m pip install -r requirements.txt")
+        print("  python egress.py")
     print(f"\nOriginal error: {e}")
     sys.exit(1)
 

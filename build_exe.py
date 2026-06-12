@@ -59,6 +59,9 @@ cmd = [
     # tiktoken + plugins: without these, xAI/OpenAI calls fail with "Unknown encoding cl100k_base"
     "--collect-all", "tiktoken",
     "--collect-all", "tiktoken_ext",
+    # Textual + Rich need collect-all (hidden-import alone misses subpackages/data files)
+    "--collect-all", "textual",
+    "--collect-all", "rich",
     # Essential hidden imports for Textual + Rich + our deps
     "--hidden-import", "textual",
     "--hidden-import", "rich",
@@ -88,10 +91,38 @@ print("")
 print("Build complete!")
 print("Portable exe is at: dist\\Egress.exe")
 
-# Copy convenience launcher and create simple instructions for recipients
-import shutil
-if os.path.exists("run-egress.bat"):
-    shutil.copy("run-egress.bat", "dist/run-egress.bat")
+# Portable launcher for dist/ (must NOT copy the source run-egress.bat — that expects a venv)
+with open("dist/run-egress.bat", "w", encoding="utf-8") as f:
+    f.write("""@echo off
+cd /d "%~dp0"
+
+REM Portable launcher — runs Egress.exe only. No Python/venv in this folder.
+if not exist "Egress.exe" (
+    echo Egress.exe not found in:
+    echo   %~dp0
+    echo.
+    pause
+    exit /b 1
+)
+
+echo Launching Egress.exe ...
+echo (To play from source instead: cd ..  then  .\\run-egress.ps1)
+echo.
+Egress.exe
+set EXITCODE=%ERRORLEVEL%
+echo.
+if %EXITCODE% NEQ 0 (
+    echo Egress.exe exited with error code %EXITCODE%.
+    echo.
+    echo Do NOT create a venv inside dist\\ — there is no requirements.txt here.
+    echo Rebuild: cd ..  then  .\\build.bat
+    echo Or run from source: cd ..  then  .\\run-egress.ps1
+    echo.
+)
+echo Press any key to close this window...
+pause >nul
+exit /b %EXITCODE%
+""")
 
 with open("dist/README.txt", "w", encoding="utf-8") as f:
     f.write("""Egress - First Descent (Portable Windows Build)

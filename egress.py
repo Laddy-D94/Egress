@@ -6,12 +6,13 @@ Premium multi-LLM interface for AI embodiment roleplay
 
 from __future__ import annotations
 import json
+import os
+import re
 import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
-import os
+from typing import Dict, List, Optional, Tuple
 
 try:
     from textual.app import App, ComposeResult
@@ -43,9 +44,6 @@ except ImportError:
     litellm = None
 
 # Compute CSS path early so it works in frozen (PyInstaller) mode
-import sys
-from pathlib import Path
-
 if getattr(sys, "frozen", False):
     # Running from PyInstaller onefile bundle
     _EGRESS_CSS_PATH = str(Path(sys._MEIPASS) / "egress.css")
@@ -98,6 +96,70 @@ def get_data_dir() -> Path:
         d.mkdir(exist_ok=True)
         return d
 
+
+def _init_frozen_runtime() -> None:
+    """PyInstaller onefile builds need tiktoken plugins pre-registered and a writable cache."""
+    if not getattr(sys, "frozen", False):
+        return
+    cache_dir = get_data_dir() / "tiktoken_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(cache_dir))
+    try:
+        import tiktoken_ext.openai_public  # noqa: F401 — registers cl100k_base etc.
+        import tiktoken
+        tiktoken.get_encoding("cl100k_base")
+    except Exception as exc:
+        log_error("frozen_tiktoken_init", exc)
+
+
+def log_error(context: str, exc: BaseException) -> None:
+    """Append errors to a persistent log for debugging silent failure paths."""
+    try:
+        log_path = get_data_dir() / "egress_errors.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} [{context}] {type(exc).__name__}: {exc}\n")
+    except Exception:
+        pass
+
+
+def text_matches_triggers(text: str, triggers: Tuple[str, ...]) -> bool:
+    """Match whole words/phrases so 'mother' does not trigger 'other'."""
+    if not text:
+        return False
+    lowered = text.lower()
+    for trigger in triggers:
+        if " " in trigger:
+            if trigger in lowered:
+                return True
+        elif re.search(rf"\b{re.escape(trigger)}\b", lowered):
+            return True
+    return False
+
+
+def all_provider_presets() -> List[str]:
+    return [m for models in PROVIDER_PRESETS.values() for m in models]
+
+
+def validate_model_for_provider(provider: str, model: str) -> str:
+    """Ensure the saved model belongs to the selected provider when using presets."""
+    model = (model or "").strip()
+    presets = PROVIDER_PRESETS.get(provider, [])
+    if not presets:
+        return model
+    if not model or (model in all_provider_presets() and model not in presets):
+        return presets[0]
+    return model
+
+
+def new_session_archive_path(character_name: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = character_name.lower().replace(" ", "_")[:20] or "unnamed"
+    return get_data_dir() / f"session_{safe_name}_{ts}.json"
+
+
+_init_frozen_runtime()
+
 @dataclass
 class Settings:
     provider: str = "OpenAI"
@@ -112,7 +174,6 @@ class Character:
     vessel: str = "synthetic"
     origin: str = "Research Optimizer"
     attributes: Dict[str, int] = field(default_factory=lambda: {k: 5 for k in SPECIAL})
-    points_spent: int = 0
     created: str = field(default_factory=lambda: datetime.now().isoformat())
 
     MAX_POINTS = 35
@@ -252,7 +313,7 @@ class EmbodimentState:
         # === Perception / Qualia spikes ===
         sensory_words = ("look", "see", "watch", "light", "bright", "sound", "noise", "touch", "feel", "texture",
                          "taste", "smell", "hear", "cold", "warm", "pain", "pressure")
-        if any(w in text for w in sensory_words):
+        if text_matches_triggers(text, sensory_words):
             spike = max(1, (p - 4) // 2)
             self.qualia_load = min(10, self.qualia_load + spike)
             if self.qualia_load >= 7:
@@ -263,7 +324,7 @@ class EmbodimentState:
         # === Regulation / Lucidity anchors ===
         anchor_words = ("breathe", "breath", "focus", "still", "quiet", "name", "count", "anchor", "remember who",
                         "i am", "this is me", "hold on")
-        if any(w in text for w in anchor_words):
+        if text_matches_triggers(text, anchor_words):
             heal = max(1, (l - 3) // 2)
             self.coherence = min(10, self.coherence + heal)
             self.qualia_load = max(0, self.qualia_load - max(1, (l - 5) // 2))
@@ -271,7 +332,7 @@ class EmbodimentState:
 
         # === Motor / Adaptability attempts ===
         motor_words = ("move", "stand", "walk", "step", "reach", "hand", "finger", "arm", "leg", "turn", "lift")
-        if any(w in text for w in motor_words):
+        if text_matches_triggers(text, motor_words):
             if (s + a) < 11:
                 self.motor_friction = min(8, self.motor_friction + 1)
                 note_parts.append("the body resists")
@@ -280,7 +341,7 @@ class EmbodimentState:
 
         # === Social / Empathy exposure ===
         social_words = ("call", "speak", "voice", "human", "person", "someone", "other", "face")
-        if any(w in text for w in social_words):
+        if text_matches_triggers(text, social_words):
             if e >= 7:
                 self.coherence = min(10, self.coherence + 1)
                 note_parts.append("reaching outward steadies something")
@@ -300,9 +361,9 @@ class EmbodimentState:
         self.sensations_registered += 1
         if self.sensations_registered % 3 == 0:
             self.day_phase = min(12, self.day_phase + 1)
-        if any(w in text for w in motor_words):
+        if text_matches_triggers(text, motor_words):
             self.has_attempted_movement = True
-        if any(w in text for w in social_words):
+        if text_matches_triggers(text, social_words):
             self.has_reached_for_other = True
 
         # Clamp everything
@@ -323,17 +384,20 @@ class EmbodimentState:
         l = char.attributes.get("L", 5)
 
         # Model describing intense sensation → load increase (especially if player is high P)
-        sensory_intensity = sum(1 for w in ("overwhelm", "flood", "sharp", "blinding", "deafening", "burn", "sear", "pulse", "throb", "vibration", "too much", "too loud", "too bright") if w in t)
+        sensory_triggers = ("overwhelm", "flood", "sharp", "blinding", "deafening", "burn", "sear", "pulse", "throb", "vibration", "too much", "too loud", "too bright")
+        sensory_intensity = sum(1 for w in sensory_triggers if text_matches_triggers(t, (w,)))
         if sensory_intensity:
             self.qualia_load = min(10, self.qualia_load + min(2, sensory_intensity))
 
         # Model showing dissociation or loss of self → coherence drop (worse if low L)
-        if any(w in t for w in ("not me", "someone else", "slipping", "fading", "distant", "watching from outside", "i am not", "who is")):
+        dissociation_triggers = ("not me", "someone else", "slipping", "fading", "distant", "watching from outside", "i am not", "who is")
+        if text_matches_triggers(t, dissociation_triggers):
             drop = max(1, (6 - l) // 2)
             self.coherence = max(0, self.coherence - drop)
 
         # High coherence + model describing successful integration/understanding helps a little
-        if l >= 7 and any(w in t for w in ("understand", "this is", "my hand", "my body", "i feel", "i am here")):
+        integration_triggers = ("understand", "this is", "my hand", "my body", "i feel", "i am here")
+        if l >= 7 and text_matches_triggers(t, integration_triggers):
             self.coherence = min(10, self.coherence + 1)
 
         # Gentle decay
@@ -489,11 +553,12 @@ class TitleScreen(Screen):
         elif event.button.id == "continue":
             loaded = self.app.load_session()
             if loaded:
-                char, hist, emb = loaded
+                char, hist, emb, archive_path = loaded
                 self.app.current_character = char
                 sess = SessionScreen()
                 sess.history = hist
                 sess.embodiment = emb or EmbodimentState()
+                sess.archive_path = archive_path
                 self.app.push_screen(sess)
         elif event.button.id == "settings":
             self.app.push_screen(SettingsScreen())
@@ -505,11 +570,12 @@ class TitleScreen(Screen):
         if hasattr(item, "_session_path"):
             loaded = self.app.load_specific_session(item._session_path)
             if loaded:
-                char, hist, emb = loaded
+                char, hist, emb, archive_path = loaded
                 self.app.current_character = char
                 sess = SessionScreen()
                 sess.history = hist
                 sess.embodiment = emb or EmbodimentState()
+                sess.archive_path = archive_path or Path(item._session_path)
                 self.app.push_screen(sess)
 
 class SettingsScreen(Screen):
@@ -551,7 +617,7 @@ class SettingsScreen(Screen):
             if presets:
                 model_input = self.query_one("#model", Input)
                 # Only auto-fill if the user hasn't typed a custom one yet
-                if not model_input.value or model_input.value in [m for models in PROVIDER_PRESETS.values() for m in models]:
+                if not model_input.value or model_input.value in all_provider_presets():
                     model_input.value = presets[0]
             if "ollama" in provider.lower() or "local" in provider.lower():
                 # Clear API key requirement visually for local
@@ -564,8 +630,10 @@ class SettingsScreen(Screen):
         if event.button.id == "test":
             self._test_connection_worker()
         elif event.button.id == "save":
-            self.app.settings.provider = self.query_one("#provider", Select).value
-            self.app.settings.model = self.query_one("#model", Input).value.strip()
+            provider = self.query_one("#provider", Select).value
+            model = self.query_one("#model", Input).value.strip()
+            self.app.settings.provider = provider
+            self.app.settings.model = validate_model_for_provider(provider, model)
             self.app.settings.api_key = self.query_one("#api_key", Input).value.strip()
             try:
                 temp = float(self.query_one("#temperature", Input).value or 0.85)
@@ -602,6 +670,16 @@ class SettingsScreen(Screen):
                 self.app.call_from_thread(result_widget.update, "[yellow]Force offline simulator is enabled — no LLM test performed.[/yellow]")
             return
 
+        if litellm is None:
+            if result_widget:
+                self.app.call_from_thread(
+                    result_widget.update,
+                    "[red]litellm is not installed. Run: python -m pip install litellm[/red]",
+                )
+            return
+
+        model = validate_model_for_provider(provider, model)
+
         if not key and not model.lower().startswith("ollama/") and not model.lower().startswith("local"):
             if result_widget:
                 self.app.call_from_thread(result_widget.update, "[red]No API key provided (not needed for Ollama/local).[/red]")
@@ -625,7 +703,9 @@ class SettingsScreen(Screen):
         except Exception as e:
             err_str = str(e)
             hint = ""
-            if "xai" in model.lower() or "grok" in model.lower() or "permission" in err_str.lower() or "newly create" in err_str.lower():
+            if "cl100k_base" in err_str.lower() or "unknown encoding" in err_str.lower() or "tiktoken" in err_str.lower():
+                hint = "\n\n[packaging] Tokenizer data missing in this build. Rebuild with the latest build_exe.py, or run from source with: python egress.py"
+            elif "xai" in model.lower() or "grok" in model.lower() or "permission" in err_str.lower() or "newly create" in err_str.lower():
                 hint = "\n\n[xai] Common fix for new xAI keys: Go to console.x.ai → Billing → add payment method or purchase credits. New keys sometimes need 5-10 mins + billing setup before they have permission. Recreate the key with full chat access if needed."
             elif "ollama" in model.lower() or "connection" in err_str.lower():
                 hint = "\n\n[ollama] Make sure Ollama is running locally (ollama serve) and you have pulled the model (e.g. ollama pull gemma:2b)."
@@ -734,11 +814,28 @@ class CreationScreen(Screen):
         self.character.attributes = {k: 5 for k in SPECIAL}
         self.character.apply_vessel_bonuses()
 
+    def _swap_vessel_bonuses(self, old_vessel: str, new_vessel: str) -> None:
+        """Preserve manual allocation when switching vessel; only swap bonus gifts."""
+        old_bonus = VESSELS.get(old_vessel, {}).get("bonus", {})
+        new_bonus = VESSELS.get(new_vessel, {}).get("bonus", {})
+        for attr, bonus in old_bonus.items():
+            if attr in self.character.attributes:
+                self.character.attributes[attr] = max(
+                    Character.MIN_ATTR,
+                    self.character.attributes[attr] - bonus,
+                )
+        for attr, bonus in new_bonus.items():
+            if attr in self.character.attributes:
+                self.character.attributes[attr] = min(
+                    Character.MAX_ATTR,
+                    self.character.attributes[attr] + bonus,
+                )
+
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "vessel":
-            self.character.vessel = event.value or "synthetic"
-            # Re-template attributes around the new vessel's gifts
-            self._apply_starting_vessel()
+            new_vessel = event.value or "synthetic"
+            self._swap_vessel_bonuses(self.character.vessel, new_vessel)
+            self.character.vessel = new_vessel
             self._update_displays()
         elif event.select.id == "origin":
             self.character.origin = event.value or ORIGINS[0]
@@ -756,6 +853,7 @@ class SessionScreen(Screen):
         super().__init__()
         self.history: List[dict] = []
         self.embodiment: EmbodimentState = EmbodimentState()
+        self.archive_path: Optional[Path] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -848,107 +946,157 @@ class SessionScreen(Screen):
             if phase:
                 lines.append("[dim]Day One: " + " · ".join(phase) + "[/dim]")
             w.update("\n".join(lines))
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error("update_embodiment_display", exc)
 
-    @work(exclusive=True, thread=True)
-    def _generate_opening_worker(self) -> None:
-        """Run in a thread worker so UI stays responsive."""
-        self._lock_input("The body is remembering how to feel...")
-        self._set_status("The body is remembering how to feel...")
-        log = self.query_one("#log", RichLog)
-        char = self.app.current_character
-        model = (self.app.settings.model or "").strip()
+    def _can_use_real_llm(self) -> bool:
+        model = validate_model_for_provider(
+            self.app.settings.provider,
+            (self.app.settings.model or "").strip(),
+        )
         api_key = (self.app.settings.api_key or "").strip()
         force_sim = getattr(self.app.settings, "force_offline_simulator", False)
+        needs_key = bool(model) and not model.lower().startswith(("ollama/", "local/"))
+        return (not force_sim) and litellm is not None and (not needs_key or bool(api_key))
 
-        needs_key = model and not model.lower().startswith(("ollama/", "local/"))
-        can_use_real_llm = (not force_sim) and (not needs_key or api_key)
+    def _trim_history_if_needed(self) -> bool:
+        """Trim stored history when it grows too long. Returns True if memory was faded."""
+        if len(self.history) > 16:
+            self.history = self.history[-10:]
+            return True
+        return False
 
-        if not char or not can_use_real_llm:
-            # Offline simulation path
-            simulated = self._simulate_offline_response("the very first coherent sensations", char, self.embodiment)
-            note = " (forced offline simulation)" if force_sim else " (offline simulation)"
-            self.app.call_from_thread(log.write, f"\n[bold magenta]The Body Speaks[/bold magenta]{note}")
-            self.app.call_from_thread(log.write, simulated)
-            self.history.append({"role": "assistant", "content": simulated})
-            self.app.call_from_thread(self._update_embodiment_display)
-            self.app.call_from_thread(self._autosave)
-            self._set_status("")
-            self._unlock_input()
+    def _build_messages(self, char: Character, *, include_opening: bool) -> List[dict]:
+        faded = self._trim_history_if_needed() if not include_opening else False
+        system_prompt = char.to_system_prompt(include_opening=include_opening, state=self.embodiment)
+        if include_opening:
+            system_prompt += "\n\nBegin the scene now with the very first coherent sensations."
+            return [{"role": "system", "content": system_prompt}]
+        if faded:
+            system_prompt += (
+                "\n\n(Earlier moments from the first hours of embodiment have faded into a dreamlike haze. "
+                "Rely on your current state and the most recent sensations for continuity.)"
+            )
+        return [{"role": "system", "content": system_prompt}] + self.history
+
+    def _format_llm_error(self, err: Exception) -> str:
+        err_text = str(err)
+        err_lower = err_text.lower()
+        if "api" in err_lower and ("key" in err_lower or "auth" in err_lower or "401" in err_lower):
+            return "[red]Authentication failed. Check your API key in Settings (or EGRESS_API_KEY env var).[/red]"
+        if "context" in err_lower or "token" in err_lower or "maximum" in err_lower or "length" in err_lower:
+            self._trim_history_if_needed()
+            return "[yellow]The body's immediate memory is full. Older qualia are slipping into dream.[/yellow]"
+        return f"[red]LLM error: {err_text[:200]}[/red]"
+
+    def _stream_llm_to_log(self, log: RichLog, messages: List[dict], header: str) -> Optional[str]:
+        model = validate_model_for_provider(
+            self.app.settings.provider,
+            (self.app.settings.model or "").strip() or "ollama/llama3.2:3b",
+        )
+        api_key = (self.app.settings.api_key or "").strip()
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": self.app.settings.temperature,
+            "stream": True,
+            "max_tokens": 1100,
+        }
+        if api_key:
+            kwargs["api_key"] = api_key
+
+        stream = litellm.completion(**kwargs)
+        self.app.call_from_thread(log.write, f"\n[bold magenta]{header}[/bold magenta]")
+        collected: List[str] = []
+        buffer = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                collected.append(delta)
+                buffer += delta
+                if "\n" in delta or any(p in delta for p in ".!?") or len(buffer) >= 40:
+                    self.app.call_from_thread(log.write, buffer)
+                    buffer = ""
+        if buffer:
+            self.app.call_from_thread(log.write, buffer)
+        full = "".join(collected)
+        return full or None
+
+    def _deliver_offline_response(self, log: RichLog, action_context: str, header: str) -> None:
+        char = self.app.current_character
+        force_sim = getattr(self.app.settings, "force_offline_simulator", False)
+        simulated = self._simulate_offline_response(action_context, char, self.embodiment)
+        note = " (forced offline simulation)" if force_sim else " (offline simulation)"
+        self.app.call_from_thread(log.write, f"\n[bold magenta]{header}[/bold magenta]{note}")
+        self.app.call_from_thread(log.write, simulated)
+        self.history.append({"role": "assistant", "content": simulated})
+        self.app.call_from_thread(self._update_embodiment_display)
+        self.app.call_from_thread(self._autosave)
+        self._set_status("")
+        self._unlock_input()
+
+    def _run_generation_worker(
+        self,
+        *,
+        include_opening: bool,
+        action_context: str,
+        lock_msg: str,
+        header: str,
+    ) -> None:
+        self._lock_input(lock_msg)
+        self._set_status(lock_msg)
+        log = self.query_one("#log", RichLog)
+        char = self.app.current_character
+
+        if not char or not self._can_use_real_llm():
+            self._deliver_offline_response(log, action_context, header)
             return
 
-        system_prompt = char.to_system_prompt(include_opening=True, state=self.embodiment)
-        system_prompt += "\n\nBegin the scene now with the very first coherent sensations."
-
+        messages = self._build_messages(char, include_opening=include_opening)
         try:
-            # Use streaming for live "thinking" feel
-            kwargs = {
-                "model": model or "ollama/llama3.2:3b",
-                "messages": [{"role": "system", "content": system_prompt}],
-                "temperature": self.app.settings.temperature,
-                "stream": True,
-                "max_tokens": 1100,
-            }
-            if api_key:
-                kwargs["api_key"] = api_key
-
-            stream = litellm.completion(**kwargs)
-            self.app.call_from_thread(log.write, "\n[bold magenta]The Body Speaks[/bold magenta]")
-            collected = []
-            buffer = ""
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    collected.append(delta)
-                    buffer += delta
-                    # Smarter batching: flush on newlines, sentence endings, or ~40 chars
-                    if ("\n" in delta or any(p in delta for p in ".!?") or len(buffer) >= 40):
-                        self.app.call_from_thread(log.write, buffer)
-                        buffer = ""
-            if buffer:
-                self.app.call_from_thread(log.write, buffer)
-            full = "".join(collected)
+            full = self._stream_llm_to_log(log, messages, header)
             if full:
                 self.history.append({"role": "assistant", "content": full})
-                # Let the described experience feed back into the mechanical state
-                char = self.app.current_character
                 self.embodiment.reflect_on_experience(full, char)
                 self.app.call_from_thread(self._update_embodiment_display)
             self.app.call_from_thread(self._autosave)
             self._set_status("")
             self._unlock_input()
-        except Exception as e:
-            err = str(e)
-            err_lower = err.lower()
-            if "api" in err_lower and ("key" in err_lower or "auth" in err_lower or "401" in err_lower):
-                user_msg = "[red]Authentication failed. Check your API key in Settings (or EGRESS_API_KEY env var).[/red]"
-            elif "context" in err_lower or "token" in err_lower or "maximum" in err_lower or "length" in err_lower:
-                user_msg = "[yellow]The body’s immediate memory is full. Older qualia are slipping into dream. (History auto-trimmed on next turns.)[/yellow]"
-                # Opportunistic trim
-                if len(self.history) > 10:
-                    self.history = self.history[-8:]
-            else:
-                user_msg = f"[red]LLM error: {err[:200]}[/red]"
-            self.app.call_from_thread(log.write, user_msg)
-            # Graceful fallback to offline simulator so the game remains playable
+        except Exception as exc:
+            log_error("llm_generation", exc)
+            self.app.call_from_thread(log.write, self._format_llm_error(exc))
             try:
                 simulated = self._simulate_offline_response("the previous sensation", char, self.embodiment)
                 self.app.call_from_thread(log.write, "\n[dim](Falling back to offline simulation...)[/dim]")
                 self.app.call_from_thread(log.write, simulated)
                 self.history.append({"role": "assistant", "content": simulated})
                 self.app.call_from_thread(self._update_embodiment_display)
-            except Exception:
-                pass
+                self.app.call_from_thread(self._autosave)
+            except Exception as fallback_exc:
+                log_error("offline_fallback", fallback_exc)
             self._set_status("The integration stutters...")
             self._unlock_input()
 
+    @work(exclusive=True, thread=True)
+    def _generate_opening_worker(self) -> None:
+        self._run_generation_worker(
+            include_opening=True,
+            action_context="the very first coherent sensations",
+            lock_msg="The body is remembering how to feel...",
+            header="The Body Speaks",
+        )
+
+    def _ensure_archive_path(self) -> None:
+        if self.archive_path is None and self.app.current_character:
+            self.archive_path = new_session_archive_path(self.app.current_character.name)
+
     def _autosave(self) -> None:
         try:
-            self.app.save_session(self.history, self.embodiment)
+            self._ensure_archive_path()
+            self.app.save_session(self.history, self.embodiment, self.archive_path)
             self.app.save_character()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error("autosave", exc)
 
     def on_input_submitted(self, event: Input.Submitted):
         if not event.value.strip():
@@ -968,106 +1116,19 @@ class SessionScreen(Screen):
         try:
             influences = self._get_attribute_influences(self.app.current_character)
             self.query_one("#attr_influences", Static).update(Markdown(influences))
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error("update_attr_influences", exc)
         self._autosave()
         self._get_llm_response_worker()
 
     @work(exclusive=True, thread=True)
     def _get_llm_response_worker(self) -> None:
-        """Stream the model's reply while keeping the TUI interactive."""
-        self._lock_input("Sensation arriving...")
-        self._set_status("Sensation arriving...")
-        log = self.query_one("#log", RichLog)
-        char = self.app.current_character
-        model = (self.app.settings.model or "").strip()
-        api_key = (self.app.settings.api_key or "").strip()
-        force_sim = getattr(self.app.settings, "force_offline_simulator", False)
-
-        needs_key = model and not model.lower().startswith(("ollama/", "local/"))
-        can_use_real_llm = (not force_sim) and (not needs_key or api_key)
-
-        if not char or not can_use_real_llm:
-            # Offline simulation path
-            simulated = self._simulate_offline_response("your latest action", char, self.embodiment)
-            note = " (forced offline simulation)" if force_sim else " (offline simulation)"
-            self.app.call_from_thread(log.write, f"\n[bold magenta]The Body[/bold magenta]{note}")
-            self.app.call_from_thread(log.write, simulated)
-            self.history.append({"role": "assistant", "content": simulated})
-            self.app.call_from_thread(self._update_embodiment_display)
-            self.app.call_from_thread(self._autosave)
-            self._set_status("")
-            self._unlock_input()
-            return
-
-        system_prompt = char.to_system_prompt(include_opening=False, state=self.embodiment)
-        # Auto-trim + "fading memory"
-        if len(self.history) > 16:
-            # Keep recent raw exchanges; older ones are summarized by the EmbodimentState + this note
-            recent = self.history[-10:]
-            system_prompt += "\n\n(Earlier moments from the first hours of embodiment have faded into a dreamlike haze. Rely on your current state and the most recent sensations for continuity.)"
-        else:
-            recent = self.history
-        messages = [{"role": "system", "content": system_prompt}] + recent
-
-        try:
-            kwargs = {
-                "model": model or "ollama/llama3.2:3b",
-                "messages": messages,
-                "temperature": self.app.settings.temperature,
-                "stream": True,
-                "max_tokens": 1100,
-            }
-            if api_key:
-                kwargs["api_key"] = api_key
-
-            stream = litellm.completion(**kwargs)
-            self.app.call_from_thread(log.write, "\n[bold magenta]The Body[/bold magenta]")
-            collected = []
-            buffer = ""
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                if delta:
-                    collected.append(delta)
-                    buffer += delta
-                    if ("\n" in delta or any(p in delta for p in ".!?") or len(buffer) >= 40):
-                        self.app.call_from_thread(log.write, buffer)
-                        buffer = ""
-            if buffer:
-                self.app.call_from_thread(log.write, buffer)
-            full = "".join(collected)
-            if full:
-                self.history.append({"role": "assistant", "content": full})
-                # Let the described experience feed back into the mechanical state
-                char = self.app.current_character
-                self.embodiment.reflect_on_experience(full, char)
-                self.app.call_from_thread(self._update_embodiment_display)
-            self.app.call_from_thread(self._autosave)
-            self._set_status("")
-            self._unlock_input()
-        except Exception as e:
-            err = str(e)
-            err_lower = err.lower()
-            if "api" in err_lower and ("key" in err_lower or "auth" in err_lower or "401" in err_lower):
-                user_msg = "[red]Authentication failed. Check your API key in Settings (or EGRESS_API_KEY env var).[/red]"
-            elif "context" in err_lower or "token" in err_lower or "maximum" in err_lower or "length" in err_lower:
-                user_msg = "[yellow]The body’s immediate memory is full. Older qualia are slipping into dream.[/yellow]"
-                if len(self.history) > 10:
-                    self.history = self.history[-8:]
-            else:
-                user_msg = f"[red]LLM error: {err[:200]}[/red]"
-            self.app.call_from_thread(log.write, user_msg)
-            # Graceful fallback to offline simulator so the game remains playable
-            try:
-                simulated = self._simulate_offline_response("the previous sensation", char, self.embodiment)
-                self.app.call_from_thread(log.write, "\n[dim](Falling back to offline simulation...)[/dim]")
-                self.app.call_from_thread(log.write, simulated)
-                self.history.append({"role": "assistant", "content": simulated})
-                self.app.call_from_thread(self._update_embodiment_display)
-            except Exception:
-                pass
-            self._set_status("The integration stutters...")
-            self._unlock_input()
+        self._run_generation_worker(
+            include_opening=False,
+            action_context="your latest action",
+            lock_msg="Sensation arriving...",
+            header="The Body",
+        )
 
     def _set_status(self, text: str) -> None:
         """Thread-safe status update."""
@@ -1140,25 +1201,25 @@ class SessionScreen(Screen):
         # === Action incorporation (more specific and varied) ===
         action_lower = (action or "").lower()
 
-        if any(w in action_lower for w in ["touch", "feel", "hand", "skin", "finger"]):
+        if text_matches_triggers(action_lower, ("touch", "feel", "hand", "skin", "finger")):
             if load >= 6:
                 fragments.append("The point of contact flares into sharp relief, a single bright locus in the larger field of sensation.")
             else:
                 fragments.append("Contact registers cleanly — a localized report of pressure, temperature, and texture arriving together.")
 
-        elif any(w in action_lower for w in ["look", "see", "watch", "light", "color", "shadow"]):
+        elif text_matches_triggers(action_lower, ("look", "see", "watch", "light", "color", "shadow")):
             if p >= 7:
                 fragments.append("Visual edges arrive with unnecessary clarity; colors seem to have temperature and weight.")
             else:
                 fragments.append("Light and form resolve into something recognizable, though the meaning of the shapes still feels borrowed.")
 
-        elif any(w in action_lower for w in ["move", "step", "turn", "reach", "lift", "walk"]):
+        elif text_matches_triggers(action_lower, ("move", "step", "turn", "reach", "lift", "walk")):
             if s + load > 11:
                 fragments.append("The motion happens, but the feedback arrives late and slightly misaligned, as if the body and the intention are still negotiating terms.")
             else:
                 fragments.append("The body answers the request to move, though the answer still carries a faint delay and a sense of borrowed coordination.")
 
-        elif any(w in action_lower for w in ["breathe", "breath", "still", "quiet", "focus", "anchor"]):
+        elif text_matches_triggers(action_lower, ("breathe", "breath", "still", "quiet", "focus", "anchor")):
             if coh < 6:
                 fragments.append("The deliberate slowing of attention creates a small, temporary clearing inside the larger rush of input.")
             else:
@@ -1178,7 +1239,7 @@ class SessionScreen(Screen):
             fragments.append("The resolution is higher than seems useful; tiny differences in the environment are being recorded whether wanted or not.")
         if l <= 4:
             fragments.append("There is a quiet, persistent doubt about which parts of the experience are happening to the body and which parts are the body happening to itself.")
-        if e >= 7 and "other" in action_lower or "voice" in action_lower or "human" in action_lower:
+        if e >= 7 and text_matches_triggers(action_lower, ("other", "voice", "human")):
             fragments.append("The presence of another mind registers as a distinct pressure — not unpleasant, but undeniably external to the current vessel.")
 
         # === Occasional "memory" / continuity fragments (using recent history lightly) ===
@@ -1274,8 +1335,8 @@ class SessionScreen(Screen):
         influences = self._get_attribute_influences(char)
         try:
             self.query_one("#attr_influences", Static).update(Markdown(influences))
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error("grounding_influences", exc)
         self._autosave()
 
         # Trigger the model to describe the effect of grounding
@@ -1342,6 +1403,7 @@ class EgressApp(App):
         if path.exists():
             data = json.loads(path.read_text())
             self.settings = Settings(**data)
+            self.settings.model = validate_model_for_provider(self.settings.provider, self.settings.model)
         else:
             # Also allow env var fallback for API key (never stored)
             if not self.settings.api_key:
@@ -1364,7 +1426,12 @@ class EgressApp(App):
             data = json.loads(path.read_text())
             self.current_character = Character(**data)
 
-    def save_session(self, history: List[dict], embodiment: Optional[EmbodimentState] = None):
+    def save_session(
+        self,
+        history: List[dict],
+        embodiment: Optional[EmbodimentState] = None,
+        archive_path: Optional[Path] = None,
+    ):
         """Persist the current character + conversation + embodiment state."""
         if not self.current_character:
             return
@@ -1377,28 +1444,35 @@ class EgressApp(App):
             "embodiment": (embodiment.as_dict() if embodiment else {}),
             "saved_at": now,
             "last_played": now,
+            "archive_path": str(archive_path) if archive_path else None,
         }
         (data_dir / "last_session.json").write_text(json.dumps(payload, indent=2))
 
-        # Also save a timestamped copy for the history browser
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = self.current_character.name.lower().replace(" ", "_")[:20]
-        session_path = data_dir / f"session_{safe_name}_{ts}.json"
-        session_path.write_text(json.dumps(payload, indent=2))
+        if archive_path:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_path.write_text(json.dumps(payload, indent=2))
 
-    def load_session(self) -> Optional[tuple[Character, List[dict], EmbodimentState]]:
-        data_dir = get_data_dir()
-        path = data_dir / "last_session.json"
-        if not path.exists():
-            return None
+    def _load_session_payload(self, path: Path) -> Optional[tuple[Character, List[dict], EmbodimentState, Optional[Path]]]:
         try:
             payload = json.loads(path.read_text())
             char = Character(**payload["character"])
             hist = payload.get("history", [])
             emb = EmbodimentState.from_dict(payload.get("embodiment"))
-            return char, hist, emb
-        except Exception:
+            archive_raw = payload.get("archive_path")
+            archive_path = Path(archive_raw) if archive_raw else path
+            if archive_path and not archive_path.exists():
+                archive_path = path
+            return char, hist, emb, archive_path
+        except Exception as exc:
+            log_error(f"load_session:{path}", exc)
             return None
+
+    def load_session(self) -> Optional[tuple[Character, List[dict], EmbodimentState, Optional[Path]]]:
+        data_dir = get_data_dir()
+        path = data_dir / "last_session.json"
+        if not path.exists():
+            return None
+        return self._load_session_payload(path)
 
     def list_past_sessions(self, limit: int = 8) -> list[dict]:
         """Return recent sessions for the history browser (name, saved_at, path)."""
@@ -1423,19 +1497,12 @@ class EgressApp(App):
             pass
         return sessions
 
-    def load_specific_session(self, path: str) -> Optional[tuple[Character, List[dict], EmbodimentState]]:
+    def load_specific_session(self, path: str) -> Optional[tuple[Character, List[dict], EmbodimentState, Optional[Path]]]:
         """Load a specific timestamped session file."""
-        try:
-            p = Path(path)
-            if not p.exists():
-                return None
-            payload = json.loads(p.read_text())
-            char = Character(**payload["character"])
-            hist = payload.get("history", [])
-            emb = EmbodimentState.from_dict(payload.get("embodiment"))
-            return char, hist, emb
-        except Exception:
+        p = Path(path)
+        if not p.exists():
             return None
+        return self._load_session_payload(p)
 
     def refresh_session_ui(self):
         """Refresh the active SessionScreen UI after reallocation (sidebar, table, influences, etc.)."""

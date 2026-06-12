@@ -21,6 +21,13 @@ except ImportError:
     print("Installing PyInstaller...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
 
+# tiktoken encoding plugins (cl100k_base etc.) are required by litellm for xAI/OpenAI calls
+try:
+    import tiktoken_ext.openai_public  # noqa: F401
+except ImportError:
+    print("Installing tiktoken for LLM token counting...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "tiktoken"])
+
 # Try to remove old exe if it exists (common cause of permission errors on Windows if it was running)
 dist_exe = os.path.join("dist", "Egress.exe")
 if os.path.exists(dist_exe):
@@ -49,11 +56,17 @@ cmd = [
     # Collect all of litellm (including its JSON data files like model_prices_and_context_window_backup.json)
     # This is required because litellm loads data files at import time.
     "--collect-all", "litellm",
+    # tiktoken + plugins: without these, xAI/OpenAI calls fail with "Unknown encoding cl100k_base"
+    "--collect-all", "tiktoken",
+    "--collect-all", "tiktoken_ext",
     # Essential hidden imports for Textual + Rich + our deps
     "--hidden-import", "textual",
     "--hidden-import", "rich",
     "--hidden-import", "platformdirs",
     "--hidden-import", "tzdata",  # silences "Hidden import tzdata not found" warning and ensures timezone data
+    "--hidden-import", "tiktoken",
+    "--hidden-import", "tiktoken_ext.openai_public",
+    "--hidden-import", "requests",
     # Additional for litellm providers if --collect-all isn't enough in future
     "--hidden-import", "litellm.llms.openai",
     "--hidden-import", "litellm.llms.xai",

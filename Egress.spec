@@ -3,8 +3,12 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('egress.css', '.')]
 binaries = []
-hiddenimports = ['textual', 'rich', 'platformdirs', 'tzdata', 'litellm.llms.openai', 'litellm.llms.xai', 'litellm.llms.ollama', 'importlib.metadata', 'pkg_resources']
+hiddenimports = ['textual', 'rich', 'platformdirs', 'tzdata', 'tiktoken', 'tiktoken_ext.openai_public', 'requests', 'litellm.llms.openai', 'litellm.llms.xai', 'litellm.llms.ollama', 'importlib.metadata', 'pkg_resources']
 tmp_ret = collect_all('litellm')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('tiktoken')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('tiktoken_ext')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

@@ -81,7 +81,13 @@ PROVIDER_PRESETS = {
     "xAI (Grok)": ["xai/grok-3", "xai/grok-3-mini-beta", "xai/grok-2-vision-latest"],
     "Google Gemini": ["gemini/gemini-1.5-pro", "gemini/gemini-2.0-flash"],
     "Groq": ["groq/llama-3.3-70b-versatile", "groq/mixtral-8x7b-32768"],
-    "Ollama (local - no API key needed)": ["ollama/llama3.2:3b", "ollama/gemma:2b", "ollama/phi3:mini", "ollama/llama3.1:8b"],
+    "Ollama (local - no API key needed)": [
+        "ollama/huihui_ai/dolphin3-abliterated:8b-llama3.1-q4_K_M",
+        "ollama/llama3.2:3b",
+        "ollama/llama3.1:8b",
+        "ollama/gemma:2b",
+        "ollama/phi3:mini",
+    ],
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

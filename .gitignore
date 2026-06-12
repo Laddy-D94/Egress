@@ -49,7 +49,7 @@ egress_data/
 # API keys / secrets (even if we try not to store them)
 *.key
 secrets/
-egress_settings.json
+# Note: settings + progress live under (ignored) egress_data/ as settings.json / last_*.json / session_*.json
 
 # Logs / temp
 *.log

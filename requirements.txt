@@ -1,6 +1,7 @@
 textual>=0.80
 rich>=13
 litellm>=1.50
+tiktoken>=0.8
 platformdirs>=4.0
 # Optional but recommended for nicer key storage
 # keyring>=25

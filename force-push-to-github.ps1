@@ -4,7 +4,15 @@
 # - The only remote commit is a trivial "Initial commit" placeholder README
 # - Your local history is the real project (full code + good README + features)
 
-$git = "C:\Users\Laine\AppData\Local\GitHubDesktop\app-3.3.4\resources\app\git\cmd\git.exe"
+$git = (Get-Command git -ErrorAction SilentlyContinue)?.Source
+if (-not $git) {
+    $desktopGit = Get-ChildItem "$env:LOCALAPPDATA\GitHubDesktop\app-*\resources\app\git\cmd\git.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $git = $desktopGit?.FullName
+}
+if (-not $git) {
+    Write-Host "Git not found. Install Git or GitHub Desktop, then run this script again." -ForegroundColor Red
+    exit 1
+}
 
 Write-Host "This will FORCE push your local commits to GitHub, replacing the remote history."
 Write-Host "The remote only has a single placeholder commit right now."

@@ -6,15 +6,18 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPython = Join-Path $scriptDir ".venv\Scripts\python.exe"
 
 if (-not (Test-Path $venvPython)) {
-    Write-Host "Virtual environment not found!" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Please set it up once with these commands:" -ForegroundColor Yellow
-    Write-Host "  python -m venv .venv" -ForegroundColor Cyan
-    Write-Host "  .\.venv\Scripts\Activate.ps1" -ForegroundColor Cyan
-    Write-Host "  python -m pip install -r requirements.txt" -ForegroundColor Cyan
-    Write-Host ""
-    pause
-    exit 1
+    Write-Host "Virtual environment not found — running setup..." -ForegroundColor Yellow
+    $setup = Join-Path $scriptDir "setup-venv.ps1"
+    if (-not (Test-Path $setup)) {
+        Write-Host "setup-venv.ps1 is missing. Run: python -m venv .venv && pip install -r requirements.txt" -ForegroundColor Red
+        pause
+        exit 1
+    }
+    & $setup
+    if (-not (Test-Path $venvPython)) {
+        pause
+        exit 1
+    }
 }
 
 Write-Host "Launching Egress in new PowerShell window..." -ForegroundColor Green

@@ -1,16 +1,21 @@
 @echo off
 cd /d "%~dp0"
 
+if not exist ".venv\Scripts\python.exe" (
+    echo Virtual environment not found — running setup...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup-venv.ps1"
+    if errorlevel 1 (
+        pause
+        exit /b 1
+    )
+)
+
 echo Activating virtual environment...
 call .venv\Scripts\activate.bat
 
 if errorlevel 1 (
     echo.
     echo ERROR: Could not activate .venv
-    echo Make sure you have run:
-    echo   python -m venv .venv
-    echo   .\.venv\Scripts\Activate.ps1
-    echo   python -m pip install -r requirements.txt
     echo.
     pause
     exit /b 1
